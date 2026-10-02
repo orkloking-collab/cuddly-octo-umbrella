@@ -118,6 +118,7 @@ Environment:
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | — | required by the Twilio adapter |
 | `SMS_HOOK_URL` | — | `POST`s `{phone, code}` to your own SMS gateway |
 | `ALLOW_INLINE_CODE` | off | dev only: returns the code in the API response so UI flows can be tested without an inbox |
+| `OTP_PHONE_HOURLY_LIMIT` / `OTP_IP_DAILY_LIMIT` | `3` / `5` | OTP send throttles; raise them while you are testing the flow |
 | `TRUST_PROXY` | off | set to `1` behind a proxy, or `X-Forwarded-For` is ignored for rate limiting |
 | `ADMIN_TOKEN` | — | gates `GET /api/admin/queue` (reports + verification review) |
 

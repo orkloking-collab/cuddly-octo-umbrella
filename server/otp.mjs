@@ -18,8 +18,11 @@ import crypto from 'node:crypto';
 
 const CODE_TTL_MS = 5 * 60_000;
 const MAX_ATTEMPTS = 5;
-const SENDS_PER_PHONE_PER_HOUR = 3;
-const SENDS_PER_IP_PER_DAY = 5;
+const num = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : fallback);
+// Tunable so a developer looping through the flow locally does not have to know
+// that a daily counter exists; the defaults are what production should use.
+const SENDS_PER_PHONE_PER_HOUR = num(process.env.OTP_PHONE_HOURLY_LIMIT, 3);
+const SENDS_PER_IP_PER_DAY = num(process.env.OTP_IP_DAILY_LIMIT, 5);
 
 export function generateCode() {
   // Rejection-free uniform digits in [100000, 999999]

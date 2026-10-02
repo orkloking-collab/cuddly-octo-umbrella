@@ -117,7 +117,14 @@ class DatingStore {
         if (e.key === STORAGE_KEY) {
           const next = safeParse(e.newValue);
           if (next) {
-            this.state = this.normalise(next);
+            // Server mirrors are not persisted (see save()), so carry this tab's
+            // copy forward instead of letting a sibling tab blank them out.
+            this.state = this.normalise({
+              ...next,
+              people: next.people || this.state.people,
+              incomingLikes: next.incomingLikes || this.state.incomingLikes,
+              server: next.server || this.state.server,
+            });
             this.emit();
           }
         }
@@ -171,7 +178,14 @@ class DatingStore {
     clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => {
       try {
-        window.localStorage?.setItem?.(STORAGE_KEY, JSON.stringify(this.state));
+        // `people`, `incomingLikes` and `server` are deliberately *not* persisted:
+        // they are mirrors of the backend, and a stale copy would outlive profile
+        // edits and make a real member look like they never changed anything.
+        const persist = { ...this.state };
+        delete persist.people;
+        delete persist.incomingLikes;
+        delete persist.server;
+        window.localStorage?.setItem?.(STORAGE_KEY, JSON.stringify(persist));
         this.channel?.postMessage({ type: 'state', origin: this.tabId, state: this.state });
       } catch (err) {
         console.warn('[dating] persistence unavailable (private mode?)', err?.name);
