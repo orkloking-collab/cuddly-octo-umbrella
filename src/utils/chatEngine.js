@@ -50,9 +50,15 @@ function sharedTopics(me, them) {
  *  { kind: 'guardrail', code, text }       — safety intervention instead of a reply
  *  { kind: 'silence', reason }             — this person does not reply (realistic)
  */
-export function replyTo(incoming, me, them, turn = 0) {
+/**
+ * `now` is injectable so the tests can pin the clock: the persona replies are
+ * deliberately re-seeded every minute (otherwise the same opener always gets the
+ * same answer), and a rotating seed inside an assertion is a flaky test waiting to
+ * fail on somebody's laptop.
+ */
+export function replyTo(incoming, me, them, turn = 0, { now = Date.now() } = {}) {
   const intent = detectIntent(incoming);
-  const seed = `${them?.id}:${intent}:${turn}:${Math.floor(Date.now() / 60000)}`;
+  const seed = `${them?.id}:${intent}:${turn}:${Math.floor(now / 60000)}`;
   const shared = sharedTopics(me, them);
 
   if (intent === 'harassment') {

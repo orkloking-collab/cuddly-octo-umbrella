@@ -143,6 +143,13 @@ class ServerSync {
       },
       quota: { day: new Date().toISOString().slice(0, 10), likes: state.quota?.used ?? 0, limit: state.quota?.limit ?? null },
       premium: state.premium ? { plan: state.premium, since: Date.now() } : null,
+      // Entitlements the server owns: which plan is live, and how much of today's
+      // video-call allowance is left. The UI renders these; it never decides them.
+      plan: state.plan || null,
+      calls: state.calls || null,
+      storageBytes: state.storageBytes ?? 0,
+      myAds: state.myAds || [],
+      call: { ...(store.getState().call || {}), secondsLeft: state.calls?.secondsLeft ?? null, resetsAt: state.calls?.resetsAt ?? null },
       incomingLikes,
       people: this.collectPeople([...deckCards, ...incomingLikes, ...matches.map((m) => m.person).filter(Boolean)], matches),
     });
@@ -228,10 +235,86 @@ class ServerSync {
     }, { label: 'profile' });
   }
 
-  message(profileId, text, kind = 'text') {
+  message(profileId, text, kind = 'text', extra = {}) {
     const matchId = this.matchIdFor(profileId);
     if (!matchId) return Promise.resolve({ error: 'match not on server', skipped: true });
-    return this.push('POST', `/api/matches/${matchId}/messages`, { text, kind }, { label: `msg:${matchId}` });
+    return this.push('POST', `/api/matches/${matchId}/messages`, {
+      text, kind, mediaUrl: extra.mediaUrl || null, durationMs: extra.durationMs || 0,
+    }, { label: `msg:${matchId}` });
+  }
+
+  /** The server match id for a card, so media uploads can reference the thread. */
+  rememberMatch(profileId, matchId) {
+    if (profileId && matchId) this.matchIds.set(profileId, matchId);
+  }
+
+  // ------------------------------------------------------------- call minutes
+  async callState() {
+    if (this.mode !== 'server') return { mode: 'local' };
+    return api.quiet('GET', '/api/calls/state');
+  }
+
+  async startCall(matchId) {
+    if (this.mode !== 'server') return { ok: true, local: true };
+    return api.quiet('POST', '/api/calls/start', { matchId });
+  }
+
+  heartbeatCall(sessionId) {
+    if (this.mode !== 'server' || !sessionId) return Promise.resolve({ ok: false });
+    return api.quiet('POST', '/api/calls/heartbeat', { sessionId });
+  }
+
+  endCall(sessionId) {
+    if (this.mode !== 'server' || !sessionId) return Promise.resolve({ ok: false });
+    return api.quiet('POST', '/api/calls/end', { sessionId });
+  }
+
+  plans() {
+    return api.quiet('GET', '/api/plans');
+  }
+
+  // ------------------------------------------------------------------ media
+  uploads() {
+    return api.quiet('GET', '/api/uploads');
+  }
+
+  deleteUpload(id) {
+    return this.push('DELETE', `/api/uploads/${encodeURIComponent(id)}`, null, { label: `upload:${id}` });
+  }
+
+  deleteAllUploads() {
+    return this.push('DELETE', '/api/uploads', null, { label: 'uploads:all' });
+  }
+
+  ads(placement = 'banner') {
+    return api.quiet('GET', `/api/ads?placement=${encodeURIComponent(placement)}`);
+  }
+
+  adPing(id, kind) {
+    return api.quiet('POST', `/api/ads/${encodeURIComponent(id)}/ping`, { kind });
+  }
+
+  createAd(campaign) {
+    return this.push('POST', '/api/ads', campaign, { label: 'ad-create' });
+  }
+
+  myAds() {
+    return api.quiet('GET', '/api/ads/mine');
+  }
+
+  googleConfig() {
+    return api.quiet('GET', '/api/auth/google/config');
+  }
+
+  async googleSignIn(credential) {
+    const out = await api.quiet('POST', '/api/auth/google', { credential });
+    if (out?.error) return { success: false, error: out.error, status: out.status };
+    this.csrf = out.csrf || this.csrf;
+    this.user = out.user || null;
+    realtimeHub.setUser(this.user);
+    if (this.user) await this.hydrate();
+    this.emit();
+    return { success: true, account: this.user, server: true };
   }
 
   markRead(profileId) {

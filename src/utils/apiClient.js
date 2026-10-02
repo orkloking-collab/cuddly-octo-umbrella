@@ -5,7 +5,26 @@
  * CSRF header, JSON parsing that never throws on an empty body, and one place to
  * decide "the API is not there" so the app can fall back to local mode.
  */
-let csrfToken = '';
+// The CSRF token comes from the API on every auth response. Keeping it in
+// localStorage (not a cookie) is the point: a cross-site attacker can send the
+// cookie but cannot read what we put in the header.
+const CSRF_KEY = 'romancha_csrf_v1';
+let csrfToken = readCsrf();
+
+function readCsrf() {
+  try {
+    return typeof window === 'undefined' ? '' : window.localStorage?.getItem?.(CSRF_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeCsrf(value) {
+  try {
+    if (value) window.localStorage?.setItem?.(CSRF_KEY, value);
+    else window.localStorage?.removeItem?.(CSRF_KEY);
+  } catch { /* storage disabled */ }
+}
 let mode = null; // null = unknown, 'server' = API available, 'local' = static hosting
 
 export class ApiError extends Error {
@@ -54,7 +73,10 @@ export async function request(method, path, body, { signal, allowFail = false } 
     signal,
   });
   const data = await parse(res);
-  if (data?.csrf) csrfToken = data.csrf;
+  if (data?.csrf) {
+    csrfToken = data.csrf;
+    writeCsrf(csrfToken);
+  }
 
   if (!res.ok) {
     const message = data?.error || `Request failed (${res.status})`;
@@ -71,7 +93,10 @@ export const api = {
   del: (path, opts) => request('DELETE', path, undefined, opts),
   /** Same call, but returns `{ error }` instead of throwing — for fire-and-forget sync. */
   quiet: (method, path, body) => request(method, path, body, { allowFail: true }),
-  setCsrf: (token) => { csrfToken = token || ''; },
+  setCsrf: (token) => {
+    csrfToken = token || '';
+    writeCsrf(csrfToken);
+  },
 };
 
 export default api;

@@ -72,6 +72,9 @@ export function createServer(backend) {
       return undefined;
     }
 
+    // Uploaded media is served from data/uploads, content-addressed and immutable.
+    if (route.startsWith('/uploads/') && backend?.uploads?.serve(req, res, route)) return undefined;
+
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.writeHead(405, BASE_HEADERS);
       res.end();

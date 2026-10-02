@@ -8,10 +8,12 @@
  */
 import crypto from 'node:crypto';
 import { buildDeck, likesBack, compatibility } from '../src/utils/matching.js';
+import { effectivePlan, FREE_PLAN } from '../src/data/plans.js';
 import { datingProfiles } from '../src/data/datingProfiles.js';
 
 const MATCH_WINDOW_HOURS = 24;
-const FREE_DAILY_LIKES = 25;
+// The like ceiling is not a constant any more: it comes from the plan catalogue in
+// src/data/plans.js, which the API and the paywall both read.
 
 const parse = (value, fallback) => {
   try {
@@ -61,15 +63,23 @@ export function createRepo(db) {
     return Object.fromEntries(list.map((d) => [d.target_id, d.kind]));
   }
 
+  /** The account's live plan: paid plans expire, so this is recomputed each time. */
+  async function planFor(userId) {
+    const user = await get('SELECT premium_plan, premium_since FROM users WHERE id = ?', [userId]);
+    const { plan, active, expiresAt } = effectivePlan(user || {});
+    return { plan, active, expiresAt, user };
+  }
+
   async function quotaFor(userId) {
     const used = await likesToday(userId);
-    const premium = await get('SELECT premium_plan FROM users WHERE id = ?', [userId]);
-    const limit = premium?.premium_plan ? Infinity : FREE_DAILY_LIKES;
+    const { plan, active } = await planFor(userId);
+    const limit = plan.dailyLikes ?? FREE_PLAN.dailyLikes;
     return {
-      limit: Number.isFinite(limit) ? limit : null,
+      limit,
       used,
-      remaining: Number.isFinite(limit) ? Math.max(0, limit - used) : null,
-      premium: Boolean(premium?.premium_plan),
+      remaining: Math.max(0, limit - used),
+      premium: active,
+      plan: plan.id,
     };
   }
 
@@ -78,6 +88,12 @@ export function createRepo(db) {
       'SELECT COUNT(*) AS n FROM decisions WHERE user_id = ? AND kind IN (?, ?) AND created_at > ?',
       [userId, 'like', 'super', startOfToday()],
     );
+    return Number(row?.n ?? 0);
+  }
+
+  async function superLikesThisWeek(userId) {
+    const weekAgo = Date.now() - 7 * 24 * 3600_000;
+    const row = await get('SELECT COUNT(*) AS n FROM decisions WHERE user_id = ? AND kind = ? AND created_at > ?', [userId, 'super', weekAgo]);
     return Number(row?.n ?? 0);
   }
 
@@ -160,7 +176,10 @@ export function createRepo(db) {
         expiresAt: m.expires_at,
         person: persona || real || { id: counterpart, name: real?.displayName || 'Someone' },
         kind: persona ? 'persona' : 'user',
-        lastMessage: last ? { id: last.id, from: last.sender_id === userId ? 'me' : 'them', text: last.body, kind: last.kind, ts: last.created_at } : null,
+        lastMessage: last ? {
+          id: last.id, from: last.sender_id === userId ? 'me' : 'them', text: last.body, kind: last.kind,
+          ts: last.created_at, media: last.media_url || null, durationMs: last.duration_ms || 0,
+        } : null,
         unread: Number(unread?.n ?? 0),
         needsHello: !last,
       });
@@ -183,21 +202,29 @@ export function createRepo(db) {
         kind: m.kind,
         ts: m.created_at,
         readAt: m.read_at,
+        media: m.media_url || null,
+        durationMs: m.duration_ms || 0,
       })),
     };
   }
 
-  async function appendMessage({ matchId, senderId, body, kind = 'text' }) {
+  async function appendMessage({ matchId, senderId, body, kind = 'text', mediaUrl = null, durationMs = 0 }) {
     const id = crypto.randomUUID();
     const now = Date.now();
     await db.run(
-      'INSERT INTO messages (id, match_id, sender_id, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, matchId, senderId, String(kind).slice(0, 20), String(body).slice(0, 4000), now],
+      'INSERT INTO messages (id, match_id, sender_id, kind, body, created_at, media_url, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        id, matchId, senderId, String(kind).slice(0, 20), String(body).slice(0, 4000), now,
+        mediaUrl ? String(mediaUrl).slice(0, 500) : null, Math.max(0, Math.round(Number(durationMs) || 0)),
+      ],
     );
     await touchFirstContact(matchId);
     const match = await get('SELECT * FROM matches WHERE id = ?', [matchId]);
     const recipient = match.user_a === senderId ? match.user_b : match.user_a;
-    return { id, matchId, senderId, body, kind, ts: now, recipient };
+    return {
+      id, matchId, senderId, body, kind, ts: now, recipient,
+      mediaUrl: mediaUrl || null, durationMs: Math.max(0, Math.round(Number(durationMs) || 0)),
+    };
   }
 
   async function markRead(matchId, userId) {
@@ -374,10 +401,14 @@ export function createRepo(db) {
   /** Decide whether a swipe converts, using the shared engine + cross-account likes. */
   async function evaluateSwipe({ userId, targetId, kind }) {
     if (kind === 'like' || kind === 'super') {
-      const used = await likesToday(userId);
-      const premium = await get('SELECT premium_plan FROM users WHERE id = ?', [userId]);
-      if (kind === 'like' && used >= FREE_DAILY_LIKES && !premium?.premium_plan) {
-        return { ok: false, reason: 'out-of-likes', remaining: 0 };
+      const quota = await quotaFor(userId);
+      if (kind === 'like' && quota.remaining <= 0) {
+        return { ok: false, reason: 'out-of-likes', remaining: 0, plan: quota.plan };
+      }
+      if (kind === 'super') {
+        const { plan } = await planFor(userId);
+        const used = await superLikesThisWeek(userId);
+        if (used >= plan.superLikesPerWeek) return { ok: false, reason: 'no-super-likes', left: 0, plan: plan.id };
       }
     }
 
@@ -399,7 +430,11 @@ export function createRepo(db) {
     } else if (otherUserId) {
       const them = await getProfile(otherUserId);
       const theyLikedMe = await get('SELECT kind FROM likes WHERE user_id = ? AND target_id = ?', [otherUserId, userId]);
-      matched = Boolean(theyLikedMe) || (kind !== 'pass' && likesBack({ ...meProfile }, { ...them.profile, match: compatibility(meProfile, them.profile) }, kind === 'super' ? 'super' : 'like'));
+      // Real people only match when they actually liked you back. The `likesBack`
+      // heuristic is for seeded personas; letting it fire here fabricated a match
+      // out of a one-sided swipe (and made "It's a match!" a lie roughly once a
+      // minute, which is exactly how this test flaked before it was pinned).
+      matched = Boolean(theyLikedMe) && kind !== 'pass';
       const existing = await get('SELECT * FROM matches WHERE (user_a = ? AND user_b = ?) OR (user_a = ? AND user_b = ?)', [userId, otherUserId, otherUserId, userId]);
       if (matched && !existing) matchId = await createMatch(userId, { otherUserId });
       counterpart = { ...them.profile, id: `usr:${otherUserId}`, isRealUser: true };
@@ -424,7 +459,221 @@ export function createRepo(db) {
     };
   }
 
+  // ------------------------------------------------------------- video calls
+  /*
+   * Call minutes are metered server-side, because "20 free minutes a day" is the
+   * product. A session is alive while the client heartbeats; its cost is
+   * (last_seen_at - started_at), so a tab that is closed mid-call stops charging
+   * within a heartbeat interval instead of burning the rest of the day.
+   */
+  const CALL_LEASE_MS = 90_000;
+
+  async function secondsUsedToday(userId) {
+    const row = await get(
+      'SELECT COALESCE(SUM(seconds), 0) AS n FROM call_sessions WHERE user_id = ? AND started_at > ?',
+      [userId, startOfToday()],
+    );
+    let live = 0;
+    const open = await all(
+      'SELECT * FROM call_sessions WHERE user_id = ? AND ended_at IS NULL AND started_at > ?',
+      [userId, startOfToday()],
+    );
+    const now = Date.now();
+    for (const session of open) {
+      // Close stale sessions lazily: no heartbeat for a minute and a half = over.
+      const billed = Math.max(0, Math.min(now, session.last_seen_at) - session.started_at) / 1000;
+      live += Math.round(billed);
+      if (now - session.last_seen_at > CALL_LEASE_MS) {
+        await db.run('UPDATE call_sessions SET ended_at = ?, seconds = seconds + ? WHERE id = ?', [
+          session.last_seen_at, Math.round(billed), session.id,
+        ]);
+      }
+    }
+    return Number(row?.n ?? 0) + live;
+  }
+
+  async function callStateFor(userId) {
+    const { plan, active, expiresAt } = await planFor(userId);
+    const used = await secondsUsedToday(userId);
+    const limit = plan.dailyCallSeconds ?? FREE_PLAN.dailyCallSeconds;
+    return {
+      plan: plan.id,
+      planLabel: plan.label,
+      active,
+      expiresAt,
+      limitSeconds: limit,
+      usedSeconds: used,
+      secondsLeft: Math.max(0, limit - used),
+      resetsAt: startOfTomorrow(),
+      priceUsd: plan.priceUsd,
+    };
+  }
+
+  async function startCall(userId, matchId = null) {
+    const state = await callStateFor(userId);
+    if (state.secondsLeft <= 0) return { ok: false, reason: 'call-quota', ...state };
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    await db.run(
+      'INSERT INTO call_sessions (id, user_id, match_id, started_at, last_seen_at, seconds) VALUES (?, ?, ?, ?, ?, 0)',
+      [id, userId, matchId ? String(matchId).slice(0, 80) : null, now, now],
+    );
+    return { ok: true, sessionId: id, ...state };
+  }
+
+  async function heartbeatCall(userId, sessionId) {
+    const session = await get('SELECT * FROM call_sessions WHERE id = ? AND user_id = ?', [String(sessionId), userId]);
+    if (!session || session.ended_at) return { ok: false, reason: 'no-such-session' };
+    const now = Date.now();
+    const delta = Math.max(0, Math.round((now - session.last_seen_at) / 1000));
+    await db.run('UPDATE call_sessions SET last_seen_at = ?, seconds = seconds + ? WHERE id = ?', [now, delta, session.id]);
+    const state = await callStateFor(userId);
+    return { ok: true, secondsLeft: state.secondsLeft, usedSeconds: state.usedSeconds, limitSeconds: state.limitSeconds };
+  }
+
+  async function endCall(userId, sessionId) {
+    const session = await get('SELECT * FROM call_sessions WHERE id = ? AND user_id = ?', [String(sessionId), userId]);
+    if (!session) return { ok: false, reason: 'no-such-session' };
+    const now = Date.now();
+    const delta = Math.max(0, Math.round((now - session.last_seen_at) / 1000));
+    await db.run('UPDATE call_sessions SET ended_at = ?, seconds = seconds + ?, last_seen_at = ? WHERE id = ?', [
+      now, delta, now, session.id,
+    ]);
+    return { ok: true, seconds: session.seconds + delta, billed: true };
+  }
+
+  async function callHistory(userId, limit = 20) {
+    const list = await all('SELECT * FROM call_sessions WHERE user_id = ? ORDER BY started_at DESC LIMIT ?', [userId, limit]);
+    return list.map((c) => ({
+      id: c.id, matchId: c.match_id, startedAt: c.started_at, endedAt: c.ended_at, seconds: c.seconds,
+    }));
+  }
+
+  // ------------------------------------------------------------------- ads
+  /*
+   * First-party placements only. Third-party ad networks on an 18+ dating app
+   * means trackers in the URL bar, malvertising and a policy fight with every
+   * payment provider, so ads here are campaigns the app itself serves and counts.
+   */
+  async function listActiveAds(placement = 'banner', limit = 8) {
+    const now = Date.now();
+    const list = await all(
+      `SELECT * FROM ad_campaigns
+       WHERE status = 'active' AND placement = ?
+         AND (starts_at IS NULL OR starts_at <= ?)
+         AND (ends_at IS NULL OR ends_at > ?)
+         AND impressions < impressions_budget
+       ORDER BY cpm_usd DESC, created_at DESC LIMIT ?`,
+      [placement, now, now, limit],
+    );
+    return list.map((a) => ({
+      id: a.id, title: a.title, imageUrl: a.image_url, targetUrl: a.target_url, placement: a.placement,
+      cpmUsd: a.cpm_usd, impressions: a.impressions, clicks: a.clicks, ownerId: a.owner_id,
+    }));
+  }
+
+  async function createAd({ ownerId, title, imageUrl, targetUrl, placement = 'banner', impressionsBudget = 1000, startsAt = null, endsAt = null, cpmUsd = 0.4 }) {
+    const id = crypto.randomUUID();
+    await db.run(
+      `INSERT INTO ad_campaigns (id, owner_id, title, image_url, target_url, placement, status, impressions_budget, created_at, starts_at, ends_at, cpm_usd)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+      [
+        id, ownerId, String(title).slice(0, 120), imageUrl ? String(imageUrl).slice(0, 500) : null,
+        String(targetUrl).slice(0, 500), String(placement).slice(0, 20), Math.max(1, Math.round(Number(impressionsBudget) || 1000)),
+        Date.now(), startsAt || null, endsAt || null, Math.max(0.05, Number(cpmUsd) || 0.4),
+      ],
+    );
+    return { id, status: 'pending', estimatedCostUsd: round2((Math.max(1, Number(impressionsBudget) || 1000) / 1000) * (Number(cpmUsd) || 0.4)) };
+  }
+
+  async function listAdsFor(ownerId) {
+    const list = await all('SELECT * FROM ad_campaigns WHERE owner_id = ? ORDER BY created_at DESC LIMIT 50', [ownerId]);
+    return list.map((a) => ({
+      id: a.id, title: a.title, imageUrl: a.image_url, targetUrl: a.target_url, placement: a.placement,
+      status: a.status, impressions: a.impressions, clicks: a.clicks, impressionsBudget: a.impressions_budget,
+      cpmUsd: a.cpm_usd, estimatedCostUsd: round4((a.impressions / 1000) * a.cpm_usd),
+      createdAt: a.created_at, startsAt: a.starts_at, endsAt: a.ends_at,
+    }));
+  }
+
+  async function countAd(id, kind, ownerId = null) {
+    const column = kind === 'click' ? 'clicks' : 'impressions';
+    if (kind !== 'click' && kind !== 'impression') return { ok: false, reason: 'unknown-kind' };
+    const ad = await get('SELECT id, owner_id, status FROM ad_campaigns WHERE id = ?', [String(id)]);
+    if (!ad || ad.status !== 'active') return { ok: false, reason: 'not-active' };
+    if (ownerId && ad.owner_id === ownerId) return { ok: true, ignored: 'own-view' };
+    await db.run(`UPDATE ad_campaigns SET ${column} = ${column} + 1 WHERE id = ?`, [ad.id]);
+    return { ok: true, kind };
+  }
+
+  async function setAdStatus(id, status) {
+    if (!['pending', 'active', 'paused', 'rejected'].includes(status)) return { ok: false, reason: 'unknown-status' };
+    await db.run('UPDATE ad_campaigns SET status = ? WHERE id = ?', [status, String(id)]);
+    return { ok: true, id, status };
+  }
+
+  // ---------------------------------------------------------------- uploads
+  async function recordUpload({ userId, path, mime, bytes, kind }) {
+    const id = crypto.randomUUID();
+    await db.run(
+      'INSERT INTO uploads (id, user_id, path, mime, bytes, kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, userId, String(path).slice(0, 500), String(mime).slice(0, 60), Math.round(Number(bytes) || 0), String(kind).slice(0, 20), Date.now()],
+    );
+    return { id, path, mime, bytes: Number(bytes) || 0 };
+  }
+
+  async function uploadsOf(userId, limit = 40) {
+    const list = await all('SELECT * FROM uploads WHERE user_id = ? ORDER BY created_at DESC LIMIT ?', [userId, limit]);
+    return list.map((u) => ({ id: u.id, url: `/uploads/${u.path}`, mime: u.mime, bytes: u.bytes, kind: u.kind, at: u.created_at }));
+  }
+
+  /**
+   * Forget an upload from the account. The blob is only unlinked when no other row
+   * still points at it (uploads are content-addressed, so two people can share one
+   * file) — that check happens in the route, which owns the filesystem.
+   */
+  async function deleteUpload(userId, id) {
+    const row = await get('SELECT * FROM uploads WHERE id = ? AND user_id = ?', [String(id), userId]);
+    if (!row) return { ok: false, reason: 'not-yours' };
+    await db.run('DELETE FROM uploads WHERE id = ?', [row.id]);
+    const others = await get('SELECT COUNT(*) AS n FROM uploads WHERE path = ?', [row.path]);
+    return { ok: true, path: row.path, sharedByOthers: Number(others?.n ?? 0) > 0 };
+  }
+
+  async function deleteAllUploads(userId) {
+    const mine = await all('SELECT path FROM uploads WHERE user_id = ?', [userId]);
+    await db.run('DELETE FROM uploads WHERE user_id = ?', [userId]);
+    return { ok: true, removed: mine.length, paths: mine.map((r) => r.path) };
+  }
+
+  async function referencedUploadPaths() {
+    const allPaths = await all('SELECT DISTINCT path FROM uploads');
+    return allPaths.map((r) => r.path);
+  }
+
+  async function storageBytesUsed(userId) {
+    const row = await get('SELECT COALESCE(SUM(bytes), 0) AS n FROM uploads WHERE user_id = ?', [userId]);
+    return Number(row?.n ?? 0);
+  }
+
   return {
+    planFor,
+    callStateFor,
+    startCall,
+    heartbeatCall,
+    endCall,
+    callHistory,
+    listActiveAds,
+    createAd,
+    listAdsFor,
+    countAd,
+    setAdStatus,
+    recordUpload,
+    uploadsOf,
+    deleteUpload,
+    deleteAllUploads,
+    referencedUploadPaths,
+    storageBytesUsed,
     getProfile,
     saveProfile,
     decisionsOf,
@@ -456,4 +705,13 @@ export function createRepo(db) {
 function startOfToday() {
   const d = new Date();
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+}
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+// Ad billing accumulates per impression, so a whole-cent rounding here would be a
+// real amount of money given away on every campaign.
+const round4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000;
+function startOfTomorrow() {
+  const d = new Date();
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
 }

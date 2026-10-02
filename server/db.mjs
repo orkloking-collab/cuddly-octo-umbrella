@@ -131,6 +131,57 @@ export const MIGRATIONS = [
       ALTER TABLE verifications ADD COLUMN expires_at INTEGER;
     `,
   },
+{
+    id: '003_media_calls_ads',
+    sql: `
+      ALTER TABLE messages ADD COLUMN media_url TEXT;
+      ALTER TABLE messages ADD COLUMN duration_ms INTEGER;
+
+      CREATE TABLE IF NOT EXISTS uploads (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS uploads_user_idx ON uploads (user_id, created_at);
+
+      /* Video-date minutes. The *server* owns the clock: a call burns time
+         between started_at and last_seen_at, so a client cannot report a
+         shorter call to keep its daily allowance. */
+      CREATE TABLE IF NOT EXISTS call_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        match_id TEXT,
+        started_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        seconds INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS call_user_day_idx ON call_sessions (user_id, started_at);
+
+      /* First-party ad placements: no third-party trackers in an 18+ app. */
+      CREATE TABLE IF NOT EXISTS ad_campaigns (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        image_url TEXT,
+        target_url TEXT NOT NULL,
+        placement TEXT NOT NULL DEFAULT 'banner',
+        status TEXT NOT NULL DEFAULT 'pending',
+        impressions_budget INTEGER NOT NULL DEFAULT 1000,
+        created_at INTEGER NOT NULL,
+        starts_at INTEGER,
+        ends_at INTEGER,
+        impressions INTEGER NOT NULL DEFAULT 0,
+        clicks INTEGER NOT NULL DEFAULT 0,
+        cpm_usd REAL NOT NULL DEFAULT 0.4
+      );
+      CREATE INDEX IF NOT EXISTS ad_status_idx ON ad_campaigns (status, placement);
+    `,
+  },
 ];
 
 /** `?` -> `$1..$n`. Throws if a literal `?` sneaks into a string constant. */

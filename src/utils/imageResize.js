@@ -38,6 +38,34 @@ export async function fileToProfilePhoto(file) {
   }
 }
 
+/**
+ * Resize an existing data URL. Used for chat attachments, where the file is going
+ * to a server and can be a bit bigger than a localStorage-safe profile photo.
+ * Re-encoding through a canvas also drops EXIF, including GPS coordinates — which
+ * matters on a dating app more than almost anywhere else.
+ */
+export async function resizeDataUrl(dataUrl, { maxEdge = 1024, quality = 0.82, mime = 'image/jpeg' } = {}) {
+  if (typeof document === 'undefined') return null;
+  const img = await loadImage(dataUrl);
+  const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+  const w = Math.max(1, Math.round((img.naturalWidth || maxEdge) * scale));
+  const h = Math.max(1, Math.round((img.naturalHeight || maxEdge) * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(img, 0, 0, w, h);
+  try {
+    const out = canvas.toDataURL(mime, quality);
+    return out.length > dataUrl.length ? dataUrl : out; // never grow the file
+  } catch {
+    return null;
+  }
+}
+
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();

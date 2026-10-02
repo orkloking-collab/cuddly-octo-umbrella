@@ -21,24 +21,31 @@
  *   POST   /api/premium                     demo checkout (no payment provider)
  *   GET    /api/admin/queue                 reports + review flags (ADMIN_TOKEN only)
  */
+import crypto from 'node:crypto';
 import {
-  createUser, authenticate, destroySession, sessionUser,
+  createUser, authenticate, destroySession, sessionUser, openSession,
   sessionCookie, clearedCookie, csrfOk, normalisePhone,
 } from './auth.mjs';
 import { createRepo } from './repo.mjs';
 import { createSmsProvider, requestOtp, confirmOtp } from './otp.mjs';
+import { PLANS, FREE_PLAN } from '../src/data/plans.js';
+import { googleEnabled, verifyIdToken } from './google.mjs';
 
 const JSON_LIMIT = 2 * 1024 * 1024;
+// An upload is a base64 data URL inside JSON, so the body is ~1.37x the file.
+// 12 MB covers our 4 MB photo and 8 MB voice-note caps; video attachments need a
+// chunked endpoint, which this build does not have (and says so).
+const UPLOAD_JSON_LIMIT = 12 * 1024 * 1024;
 const READ_ONLY = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-function readJson(req) {
+function readJson(req, { maxBytes = JSON_LIMIT, tooLarge = 'That is bigger than this server accepts.' } = {}) {
   return new Promise((resolve, reject) => {
     let size = 0;
     let body = '';
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > JSON_LIMIT) {
-        reject(Object.assign(new Error('payload too large'), { status: 413 }));
+      if (size > maxBytes) {
+        reject(Object.assign(new Error(tooLarge), { status: 413 }));
         req.destroy();
         return;
       }
@@ -77,7 +84,7 @@ function createLimiter({ windowMs = 60_000, max = 20 } = {}) {
   };
 }
 
-export function createApi({ db, getRealtime = () => null, log = () => {} } = {}) {
+export function createApi({ db, getRealtime = () => null, log = () => {}, uploads = null } = {}) {
   const repo = createRepo(db);
   const sms = createSmsProvider({ log });
   const limitAuth = createLimiter({ windowMs: 60_000, max: 40 });
@@ -105,9 +112,68 @@ export function createApi({ db, getRealtime = () => null, log = () => {} } = {})
         return send(res, 200, {
           ok: true, mode: 'server', db: db.kind, authMode: 'session-cookie',
           sms: sms.provider?.name || process.env.SMS_PROVIDER || 'console',
+          uploads: uploads ? Boolean(uploads.root) : false,
+          google: googleEnabled(),
+          plans: PLANS.map((p) => p.id),
           online: getRealtime()?.onlineUsers?.() || [],
           at: Date.now(),
         });
+      }
+
+      // Public: the price list the UI renders and the API enforces.
+      if (route === '/api/plans' && READ_ONLY.has(req.method)) {
+        return send(res, 200, { free: FREE_PLAN, plans: PLANS, currency: { usdBdt: Number(process.env.USD_BDT || 118) } });
+      }
+
+      if (route === '/api/ads' && READ_ONLY.has(req.method)) {
+        const ads = await repo.listActiveAds(url.searchParams.get('placement') || 'banner');
+        return send(res, 200, { ads, note: 'First-party placements only — no third-party ad networks in this app.' });
+      }
+
+      const adPing = route.match(/^\/api\/ads\/([\w-]+)\/ping$/);
+      if (adPing && req.method === 'POST') {
+        body = await readJson(req);
+        const out = await repo.countAd(adPing[1], body.kind === 'click' ? 'click' : 'impression', session?.user?.id || null);
+        return send(res, out.ok ? 200 : 404, out);
+      }
+
+      if (route === '/api/auth/google/config' && READ_ONLY.has(req.method)) {
+        return send(res, 200, {
+          enabled: googleEnabled(),
+          clientId: googleEnabled() ? process.env.GOOGLE_CLIENT_ID.split(',')[0].trim() : null,
+        });
+      }
+
+      // Google Identity Services: the browser hands us an ID token, we verify it.
+      if (route === '/api/auth/google' && req.method === 'POST') {
+        if (limitAuth(`goog:${ip}`)) return send(res, 429, { error: 'Too many attempts. Wait a minute.' });
+        // A cross-site login attempt (attacker logs the victim into *their* account)
+        // is cheap to block: same-origin or nothing.
+        const origin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer).origin : '');
+        if (origin && origin !== `${req.headers['x-forwarded-proto'] || 'http'}://${(req.headers.host || '').replace(/:\d+$/, '')}`) {
+          const allowed = (process.env.PUBLIC_ORIGIN || '').split(',').map((v) => v.trim()).filter(Boolean);
+          if (!allowed.includes(origin)) return send(res, 403, { error: 'That sign-in request came from another site.' });
+        }
+        body = await readJson(req);
+        const verified = await verifyIdToken(body.credential);
+        if (verified.error) return send(res, verified.status, { error: verified.error });
+        let user = await db.get('SELECT * FROM users WHERE email = ?', [verified.email]);
+        if (!user) {
+          const created = await createUser(db, {
+            email: verified.email,
+            // No password exists for a Google account: random 32 bytes, never shown.
+            password: crypto.randomBytes(24).toString('base64url'),
+            displayName: verified.name || verified.email.split('@')[0],
+          });
+          if (created.error) return send(res, created.status || 500, { error: created.error });
+          if (verified.picture) {
+            await repo.saveProfile(created.user.id, { profile: { name: created.user.displayName, avatar: verified.picture } });
+          }
+          user = await db.get('SELECT * FROM users WHERE email = ?', [verified.email]);
+        }
+        const authed = await openSession(db, user, req.headers['user-agent']);
+        res.setHeader('Set-Cookie', sessionCookie(authed.session.token, { secure }));
+        return send(res, 200, { user: authed.user, csrf: authed.session.csrf, linkedGoogle: true });
       }
 
       if (route === '/api/auth/register' && req.method === 'POST') {
@@ -162,6 +228,12 @@ export function createApi({ db, getRealtime = () => null, log = () => {} } = {})
           repo.listReports(userId),
           repo.verification(userId),
         ]);
+        const [planInfo, calls, storageBytes, ads] = await Promise.all([
+          repo.planFor(userId),
+          repo.callStateFor(userId),
+          repo.storageBytesUsed(userId),
+          repo.listAdsFor(userId),
+        ]);
         return send(res, 200, {
           user: session.user,
           profile: profile.profile,
@@ -173,7 +245,11 @@ export function createApi({ db, getRealtime = () => null, log = () => {} } = {})
           verification,
           quota: deck.quota,
           likedMeCount: deck.likedMeCount,
-          premium: session.user.premiumPlan || null,
+          premium: planInfo.active ? planInfo.plan.id : null,
+          plan: { ...planInfo.plan, expiresAt: planInfo.expiresAt, active: planInfo.active },
+          calls,
+          storageBytes,
+          myAds: ads,
         });
       }
 
@@ -230,15 +306,31 @@ export function createApi({ db, getRealtime = () => null, log = () => {} } = {})
           return send(res, 200, { ok: true });
         }
         body = await readJson(req);
+        const kind = ['text', 'photo', 'voice'].includes(body.kind) ? body.kind : 'text';
         // eslint-disable-next-line no-control-regex -- zero-width and control junk is exactly what we strip
         const text = String(body.text || '').replace(/[\u0000-\u001F\u200B-\u200D]/g, '').trim().slice(0, 2000);
-        if (!text) return send(res, 400, { error: 'Empty message' });
+        // Media arrives as a path from /api/uploads, never as a URL the server fetches.
+        const mediaUrl = typeof body.mediaUrl === 'string' && /^\/uploads\/[a-f0-9]{40}\.[a-z0-9]{2,4}$/.test(body.mediaUrl)
+          ? body.mediaUrl
+          : null;
+        if (!text && !mediaUrl) return send(res, 400, { error: 'Empty message' });
         const saved = await repo.appendMessage({
-          matchId, senderId: userId, body: text, kind: ['text', 'photo', 'voice'].includes(body.kind) ? body.kind : 'text',
+          matchId,
+          senderId: userId,
+          // A media message still carries a caption so previews and search have text.
+          body: text || (kind === 'voice' ? 'Voice note' : kind === 'photo' ? 'Photo' : ''),
+          kind,
+          mediaUrl,
+          durationMs: body.durationMs,
         });
         // Push to the recipient's open stream so chat is live, not poll-then-pray.
         const delivered = getRealtime()?.sendTo?.(saved.recipient, {
-          type: 'chat', matchId, message: { id: saved.id, from: 'them', text, kind: saved.kind, ts: saved.ts }, at: saved.ts,
+          type: 'chat', matchId,
+          message: {
+            id: saved.id, from: 'them', text: saved.body, kind: saved.kind, ts: saved.ts,
+            media: saved.mediaUrl, durationMs: saved.durationMs,
+          },
+          at: saved.ts,
         });
         return send(res, 201, { ...saved, delivered: Boolean(delivered) });
       }
@@ -316,9 +408,121 @@ export function createApi({ db, getRealtime = () => null, log = () => {} } = {})
 
       if (route === '/api/premium' && req.method === 'POST') {
         body = await readJson(req);
-        const plan = body.plan === null || body.plan === '' ? null : String(body.plan).slice(0, 20);
-        await repo.setPremium(userId, plan);
-        return send(res, 200, { ok: true, plan, note: 'Demo checkout — no payment provider is wired up.' });
+        const requested = body.plan === null || body.plan === '' ? null : String(body.plan).slice(0, 20);
+        if (requested && !PLANS.some((p) => p.id === requested)) {
+          return send(res, 400, { error: `Unknown plan. Choose one of: ${PLANS.map((p) => p.id).join(', ')}` });
+        }
+        await repo.setPremium(userId, requested);
+        const calls = await repo.callStateFor(userId);
+        return send(res, 200, {
+          ok: true, plan: requested, ...calls,
+          note: 'Demo checkout — no payment provider is wired up, so nothing was charged. Set STRIPE_SECRET_KEY (or a bKash/Nagad merchant account) to make this real.',
+        });
+      }
+
+      // ---- video-date minutes ----
+      if (route === '/api/calls/state' && READ_ONLY.has(req.method)) {
+        return send(res, 200, await repo.callStateFor(userId));
+      }
+
+      if (route === '/api/calls/history' && READ_ONLY.has(req.method)) {
+        return send(res, 200, { calls: await repo.callHistory(userId) });
+      }
+
+      if (route === '/api/calls/start' && req.method === 'POST') {
+        body = await readJson(req);
+        const out = await repo.startCall(userId, body.matchId || null);
+        return send(res, out.ok ? 201 : 429, out);
+      }
+
+      if (route === '/api/calls/heartbeat' && req.method === 'POST') {
+        body = await readJson(req);
+        if (!body.sessionId) return send(res, 400, { error: 'sessionId is required' });
+        const out = await repo.heartbeatCall(userId, body.sessionId);
+        return send(res, out.ok ? 200 : 404, out);
+      }
+
+      if (route === '/api/calls/end' && req.method === 'POST') {
+        body = await readJson(req);
+        if (!body.sessionId) return send(res, 400, { error: 'sessionId is required' });
+        const out = await repo.endCall(userId, body.sessionId);
+        return send(res, out.ok ? 200 : 404, { ...out, ...(out.ok ? await repo.callStateFor(userId) : {}) });
+      }
+
+      // ---- uploads ----
+      if (route === '/api/uploads' && req.method === 'POST') {
+        if (!uploads) return send(res, 503, { error: 'Upload storage is disabled on this server.' });
+        if (limitAuth(`up:${ip}`)) return send(res, 429, { error: 'Too many uploads in a short window. Slow down.' });
+        body = await readJson(req, {
+          maxBytes: UPLOAD_JSON_LIMIT,
+          tooLarge: 'That file is too big to upload here (4 MB per photo, 8 MB per voice note).',
+        });
+        const used = await repo.storageBytesUsed(userId);
+        if (used > uploads.maxBytesPerUser) {
+          return send(res, 507, { error: 'Your media storage is full. Delete something in Safety → Your data.' });
+        }
+        let saved;
+        try {
+          saved = await uploads.save({ data: body.dataUrl || body.data, kind: body.kind || 'image' });
+        } catch (err) {
+          return send(res, err.status || 400, { error: err.message });
+        }
+        const row = await repo.recordUpload({ userId, ...saved });
+        return send(res, 201, { ...saved, id: row.id, usedBytes: used + saved.bytes });
+      }
+
+      if (route === '/api/uploads' && READ_ONLY.has(req.method)) {
+        return send(res, 200, {
+          files: await repo.uploadsOf(userId),
+          usedBytes: await repo.storageBytesUsed(userId),
+          quotaBytes: uploads?.maxBytesPerUser ?? 0,
+        });
+      }
+
+      const uploadDelete = route.match(/^\/api\/uploads\/([\w-]+)$/);
+      if (uploadDelete && req.method === 'DELETE') {
+        const out = await repo.deleteUpload(userId, uploadDelete[1]);
+        if (!out.ok) return send(res, 404, out);
+        // Only unlink when no other account references the same bytes.
+        if (!out.sharedByOthers && uploads) uploads.remove(out.path);
+        return send(res, 200, { ok: true, freedBytes: true, shared: out.sharedByOthers });
+      }
+
+      if (route === '/api/uploads' && req.method === 'DELETE') {
+        const out = await repo.deleteAllUploads(userId);
+        if (uploads) {
+          const keep = new Set(await repo.referencedUploadPaths());
+          uploads.sweep(keep);
+        }
+        return send(res, 200, { ok: true, removed: out.removed });
+      }
+
+      // ---- ad manager (first-party placements) ----
+      if (route === '/api/ads/mine' && READ_ONLY.has(req.method)) {
+        return send(res, 200, { campaigns: await repo.listAdsFor(userId) });
+      }
+
+      if (route === '/api/ads' && req.method === 'POST') {
+        body = await readJson(req);
+        if (!body.title || !body.targetUrl) return send(res, 400, { error: 'title and targetUrl are required' });
+        // Only http(s) targets: a `javascript:` or `data:` href is an XSS payload
+        // with a friendly face.
+        if (!/^https?:\/\//i.test(String(body.targetUrl))) return send(res, 400, { error: 'targetUrl must start with http:// or https://' });
+        const out = await repo.createAd({
+          ownerId: userId, title: body.title, imageUrl: body.imageUrl, targetUrl: body.targetUrl,
+          placement: body.placement, impressionsBudget: body.impressionsBudget, startsAt: body.startsAt, endsAt: body.endsAt, cpmUsd: body.cpmUsd,
+        });
+        log(`[ads] campaign ${out.id} from ${userId} pending review`);
+        return send(res, 201, { ...out, note: 'Campaigns go live after review. No payment is taken yet — pricing is an estimate.' });
+      }
+
+      if (route === '/api/admin/ads' && req.method === 'POST') {
+        if (!process.env.ADMIN_TOKEN || url.searchParams.get('token') !== process.env.ADMIN_TOKEN) {
+          return send(res, 403, { error: 'Set ADMIN_TOKEN and pass ?token= to moderate ads.' });
+        }
+        body = await readJson(req);
+        const out = await repo.setAdStatus(body.id, body.status);
+        return send(res, out.ok ? 200 : 400, out);
       }
 
       if (route === '/api/admin/queue' && READ_ONLY.has(req.method)) {

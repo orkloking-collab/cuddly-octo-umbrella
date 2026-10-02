@@ -76,6 +76,8 @@ const DEFAULT_STATE = {
   server: { mode: 'local', user: null, error: null, busy: 0 },
   people: {},
   incomingLikes: [],
+  // Video-date minutes (mirrored from the server; local counter in localStorage).
+  call: { sessionId: null, secondsLeft: null, startedAt: null, deniedAt: null, resetsAt: null },
 };
 
 function deepClone(obj) {
@@ -484,6 +486,30 @@ class DatingStore {
     return msg;
   }
 
+  /** Attach media that has already been uploaded (photo / voice note / video). */
+  sendMedia(profileId, { kind = 'photo', url, bytes = 0, durationMs = 0, text = '', note = '', localOnly = false } = {}) {
+    if (!url) return null;
+    const label = kind === 'voice' ? 'Voice note' : kind === 'video' ? 'Video' : 'Photo';
+    const msg = this.appendMessage(profileId, {
+      from: 'me',
+      kind,
+      text: String(text || '').slice(0, 600) || label,
+      media: url,
+      mediaBytes: Math.round(Number(bytes) || 0),
+      durationMs: Math.round(Number(durationMs) || 0),
+      note: note || (localOnly ? `${label} · this tab only, nothing was uploaded` : ''),
+      localOnly: Boolean(localOnly),
+    });
+    if (this.isRemoteId(profileId)) {
+      serverSync.message(profileId, msg.text, kind, { mediaUrl: localOnly ? null : url, durationMs: msg.durationMs })
+        .then((res) => {
+          if (res?.error && res?.skipped) this.setServerStatus({ error: 'This chat is local only — the match is not saved on the server yet.' });
+          else if (res?.error) this.setServerStatus({ error: res.error });
+        });
+    }
+    return msg;
+  }
+
   sendText(profileId, text, kind = 'text') {
     // eslint-disable-next-line no-control-regex -- pasted emoji/zero-width junk is exactly what we strip
     const clean = String(text || '').replace(/[\u0000-\u001F\u200B-\u200D]/g, '').slice(0, 1200).trim();
@@ -644,9 +670,76 @@ class DatingStore {
     return this.state.verification;
   }
 
+  // ------------------------------------------------------------ video minutes
+  /**
+   * Ask for permission to start a video date. Free accounts get a fixed number of
+   * minutes per rolling 24h; the count comes from the server so a second device
+   * (or an incognito tab) cannot be used to double it.
+   */
+  async reserveCall(profileId) {
+    const out = await serverSync.startCall(serverSync.matchIdFor(profileId) || profileId);
+    if (out?.local) {
+      const used = this.localCallSecondsToday();
+      const limit = this.isPremium() ? 2 * 3600 : 20 * 60;
+      if (used >= limit) return { ok: false, reason: 'call-quota', secondsLeft: 0, localOnly: true };
+      const sessionId = `local-${Date.now()}`;
+      this.update({ ...this.state, call: { sessionId, startedAt: Date.now(), secondsLeft: limit - used, plan: 'local' } });
+      return { ok: true, sessionId, secondsLeft: limit - used, localOnly: true };
+    }
+    if (!out?.ok) {
+      this.update({ ...this.state, call: { deniedAt: Date.now(), secondsLeft: out?.secondsLeft ?? 0, resetsAt: out?.resetsAt, plan: out?.plan } });
+      return { ok: false, reason: out?.reason || 'call-unavailable', secondsLeft: out?.secondsLeft ?? 0, resetsAt: out?.resetsAt, plan: out?.plan, error: out?.error };
+    }
+    this.update({ ...this.state, call: { sessionId: out.sessionId, startedAt: Date.now(), secondsLeft: out.secondsLeft, plan: out.plan } });
+    return out;
+  }
+
+  noteCallHeartbeat(out) {
+    if (!out?.ok) return;
+    this.update({ ...this.state, call: { ...(this.state.call || {}), secondsLeft: out.secondsLeft, usedSeconds: out.usedSeconds, limitSeconds: out.limitSeconds } }, { silent: true });
+  }
+
+  async releaseCall() {
+    const sessionId = this.state.call?.sessionId;
+    if (!sessionId) return null;
+    const out = await serverSync.endCall(sessionId);
+    this.update({ ...this.state, call: { ...(this.state.call || {}), sessionId: null, endedAt: Date.now(), secondsLeft: out?.secondsLeft ?? this.state.call?.secondsLeft } });
+    return out;
+  }
+
+  localCallSecondsToday() {
+    const key = 'romancha_call_seconds_v1';
+    const day = today();
+    let saved = null;
+    try {
+      saved = safeParse(window.localStorage?.getItem?.(key));
+    } catch { saved = null; }
+    if (!saved || saved.day !== day) return 0;
+    return Number(saved.seconds) || 0;
+  }
+
+  addLocalCallSeconds(seconds) {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    const day = today();
+    const previous = this.localCallSecondsToday();
+    try {
+      window.localStorage?.setItem?.('romancha_call_seconds_v1', JSON.stringify({ day: day === today() ? day : today(), seconds: previous + Math.max(0, Math.round(seconds)) }));
+    } catch { /* storage disabled */ }
+  }
+
+  /**
+   * Buy a plan. On a connected server this is an API call whose response decides
+   * what the client believes — including how many call minutes that plan unlocks —
+   * so the paywall cannot be talked into a bigger allowance than the API allows.
+   */
   setPremium(plan) {
     this.update({ ...this.state, premium: plan ? { plan, since: Date.now() } : null });
-    serverSync.setPremium(plan);
+    return serverSync.setPremium(plan).then((out) => {
+      if (out?.limitSeconds != null) {
+        this.update({ ...this.state, call: { ...(this.state.call || {}), secondsLeft: out.secondsLeft, limitSeconds: out.limitSeconds } });
+      }
+      return out && typeof out === 'object' ? out : { note: 'Saved on this device only — start the server to put it on your account.' };
+    });
   }
 
   boost(hours = 0.5) {

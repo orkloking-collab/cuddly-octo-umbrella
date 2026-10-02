@@ -351,6 +351,21 @@ class AuthManager {
     return this.login(email, password);
   }
 
+  /**
+   * Google sign-in. The browser got an ID token from Google's own button; the
+   * server verifies it and returns an account. Nowhere in this flow does Romancha
+   * see, ask for, or store a Google password.
+   */
+  async googleSignIn(credential) {
+    if (serverSync.mode === 'local') {
+      return { success: false, error: 'Google sign-in needs the Romancha server running (npm start). This build is in local-only mode.' };
+    }
+    const res = await serverSync.googleSignIn(credential);
+    if (!res?.success) return { success: false, error: res?.error || 'Google sign-in failed.' };
+    const merged = this.adoptServerUser(res.account);
+    return { success: true, account: merged, mode: 'server', linkedGoogle: true };
+  }
+
   async signUp(userData = {}) {
     if (serverSync.mode !== 'local') {
       const res = await serverSync.register({

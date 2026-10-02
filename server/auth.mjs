@@ -141,6 +141,16 @@ export async function authenticate(db, { email, password, userAgent = '' }) {
   }
 
   await db.run('UPDATE users SET failed_attempts = 0, locked_until = 0 WHERE id = ?', [user.id]);
+  return openSession(db, user, userAgent);
+}
+
+/**
+ * Mint a session for an already-authenticated user row. Split out because Google
+ * sign-in authenticates by ID token instead of by password, and a second copy of
+ * the cookie/session logic is exactly how a login path ends up skipping the
+ * lockout reset or the CSRF token.
+ */
+export async function openSession(db, user, userAgent = '') {
   const sessionToken = token(32);
   const csrf = token(16);
   const now = Date.now();
@@ -149,7 +159,7 @@ export async function authenticate(db, { email, password, userAgent = '' }) {
     [digest(sessionToken), user.id, csrf, now, now + SESSION_TTL_MS, String(userAgent).slice(0, 200)],
   );
   return {
-    user: { id: user.id, email: user.email, phone: user.phone, displayName: user.display_name },
+    user: { id: user.id, email: user.email, phone: user.phone, displayName: user.display_name, premiumPlan: user.premium_plan },
     session: { token: sessionToken, csrf },
   };
 }

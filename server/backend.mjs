@@ -6,9 +6,11 @@
  *
  * `handle` claims every /api/* request and calls `next()` for anything else.
  */
+import path from 'node:path';
 import { createDb } from './db.mjs';
 import { createRealtimeStore } from './realtimeApi.mjs';
 import { createApi } from './api.mjs';
+import { createUploadStore } from './uploads.mjs';
 
 const REALTIME_ROUTES = new Map([
   ['/api/realtime/stream', 'stream'],
@@ -20,8 +22,9 @@ const REALTIME_ROUTES = new Map([
 
 export async function createBackend({ log = console.error } = {}) {
   const db = await createDb({ file: process.env.ROMANCHA_DB, url: process.env.DATABASE_URL });
+  const uploads = createUploadStore({ dir: process.env.ROMANCHA_UPLOADS || path.join(process.cwd(), 'data', 'uploads') });
   const { handlers, sendTo, onlineUsers } = createRealtimeStore();
-  const api = createApi({ db, getRealtime: () => ({ sendTo, onlineUsers }), log });
+  const api = createApi({ db, getRealtime: () => ({ sendTo, onlineUsers }), log, uploads });
 
   const handle = (req, res, next) => {
     let pathname;
@@ -52,6 +55,7 @@ export async function createBackend({ log = console.error } = {}) {
       return handler(req, res);
     }
 
+    if (pathname.startsWith('/uploads/')) return uploads.serve(req, res, pathname) || undefined;
     if (pathname === '/api/health') return api.handle(req, res, next);
     if (pathname.startsWith('/api/')) return api.handle(req, res, next);
     return next?.();
@@ -60,6 +64,7 @@ export async function createBackend({ log = console.error } = {}) {
   return {
     handle,
     db,
+    uploads,
     sendTo,
     onlineUsers,
     close: () => db.close?.(),
