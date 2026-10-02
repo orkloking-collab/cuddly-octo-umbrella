@@ -1,0 +1,91 @@
+import React from 'react';
+import { Crown, ShieldCheck, Users, Sparkles, ChevronRight } from 'lucide-react';
+
+/**
+ * Promoted placements.
+ *
+ * This component used to inject third-party ad scripts (a popunder network and
+ * two `document.write` "native ad" iframes from unknown hosts). That was the
+ * single biggest trust and security hole in the app: arbitrary remote JS with
+ * write access to the page, no consent string, no COPPA/gdpr handling, and an
+ * "18+ ads" label next to unvetted inventory. It is gone.
+ *
+ * What remains is first-party promotion only — content we control, no network
+ * requests, nothing that can serve malware or a scam ad to a dating user.
+ */
+
+const PLACEMENTS = [
+  {
+    kind: 'premium',
+    icon: Crown,
+    kicker: 'Promoted · Romancha Gold',
+    title: 'See the 12 people who already liked you',
+    body: 'Gold removes the daily like cap, unlocks incognito browsing and shows every incoming like unblurred.',
+    cta: 'Show me',
+  },
+  {
+    kind: 'safety',
+    icon: ShieldCheck,
+    kicker: 'Community note',
+    title: 'Never send money. Ever.',
+    body: '“Emergency”, “crypto tip”, “gift card for my sister” — if it involves money, report and block. Trust & Safety reviews reports within 24 hours.',
+    cta: 'Open Safety Centre',
+  },
+  {
+    kind: 'event',
+    icon: Users,
+    kicker: 'Local event',
+    title: 'Midnight Writers’ Mixer — Sunday 9pm',
+    body: 'Speed-dating round where the opener is a story prompt. 84 people registered in your region.',
+    cta: 'Join the list',
+  },
+];
+
+export function Banner728x90({ onAction, index = 0 }) {
+  const slot = PLACEMENTS[index % PLACEMENTS.length];
+  const Icon = slot.icon;
+  return (
+    <aside
+      className="glass-card flex w-full max-w-[728px] items-center gap-3 rounded-2xl border border-white/10 px-3.5 py-3"
+      aria-label="Promoted content"
+    >
+      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-rose-600/70 to-fuchsia-600/60 text-white">
+        <Icon className="h-5 w-5" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-[9.5px] font-bold uppercase tracking-[0.16em] text-rose-300/70">{slot.kicker}</p>
+        <p className="truncate text-[13px] font-semibold text-white">{slot.title}</p>
+        <p className="line-clamp-1 text-[11.5px] text-rose-100/60">{slot.body}</p>
+      </div>
+      <button
+        onClick={() => onAction?.(slot.kind)}
+        className="flex shrink-0 items-center gap-1 rounded-xl border border-rose-400/40 bg-rose-500/15 px-2.5 py-1.5 text-[11px] font-bold text-rose-100 transition hover:bg-rose-500/25"
+      >
+        {slot.cta} <ChevronRight className="h-3 w-3" />
+      </button>
+    </aside>
+  );
+}
+
+export default function AdBanner({ type = 'banner', adIndex = 0, onAction }) {
+  if (type === 'native') {
+    return (
+      <div className="my-4 flex justify-center">
+        <Banner728x90 index={adIndex} onAction={onAction} />
+      </div>
+    );
+  }
+  return (
+    <div className="border-y border-rose-900/25 bg-[#120a1c]/70 px-3 py-2">
+      <div className="mx-auto flex max-w-[900px] items-center justify-center gap-2">
+        <Sparkles className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+        <p className="truncate text-[11.5px] text-rose-100/70">
+          No trackers, no popunders, no third-party ad networks on Romancha — your dating activity is not for sale.
+          <button onClick={() => onAction?.('premium')} className="ml-2 font-semibold text-rose-300 underline-offset-2 hover:underline">
+            Support the site with Gold
+          </button>
+        </p>
+      </div>
+    </div>
+  );
+}

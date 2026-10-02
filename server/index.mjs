@@ -1,0 +1,122 @@
+/**
+ * Romancha production server: static SPA + realtime API + a couple of
+ * hardening headers. No framework, no build step, ~2 requests/second is fine
+ * for a prototype; put nginx or a CDN in front for anything bigger.
+ *
+ *   npm run build && npm start   ->  http://localhost:3000
+ */
+import http from 'node:http';
+import { createReadStream, promises as fs } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRealtimeStore } from './realtimeApi.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '0.0.0.0';
+
+const TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.json': 'application/json; charset=utf-8',
+  '.woff2': 'font/woff2',
+};
+
+const BASE_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(self), interest-cohort=()',
+  'Cross-Origin-Opener-Policy': 'same-origin',
+};
+
+async function exists(file) {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function createServer() {
+  const { handlers } = createRealtimeStore();
+
+  return http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const route = url.pathname;
+
+    if (route.startsWith('/api/realtime/')) {
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type' });
+        res.end();
+        return;
+      }
+      if (route === '/api/realtime/stream') return handlers.stream(req, res);
+      if (route === '/api/realtime/publish' && req.method === 'POST') return handlers.publish(req, res);
+      if (route === '/api/realtime/presence' && req.method === 'POST') return handlers.presence(req, res);
+      if (route === '/api/realtime/health') return handlers.health(req, res);
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unknown endpoint' }));
+      return;
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, BASE_HEADERS);
+      res.end();
+      return;
+    }
+
+    // Resolve inside ROOT only — no ../ escapes.
+    const clean = path.normalize(route).replace(/^(\.\.[/\\])+/, '');
+    let filePath = path.join(ROOT, clean);
+    if (!filePath.startsWith(ROOT)) {
+      res.writeHead(403, BASE_HEADERS);
+      res.end('forbidden');
+      return;
+    }
+
+    (async () => {
+      if (await exists(filePath)) {
+        const stat = await fs.stat(filePath);
+        if (stat.isDirectory()) filePath = path.join(filePath, 'index.html');
+      } else {
+        filePath = path.join(ROOT, 'index.html'); // SPA fallback
+      }
+
+      const ext = path.extname(filePath);
+      const isHtml = ext === '.html';
+      res.writeHead(200, {
+        ...BASE_HEADERS,
+        'Content-Type': TYPES[ext] || 'application/octet-stream',
+        'Cache-Control': isHtml ? 'no-cache' : 'public, max-age=31536000, immutable',
+      });
+
+      const stream = createReadStream(filePath);
+      stream.on('error', () => {
+        res.writeHead(500, BASE_HEADERS);
+        res.end('server error');
+      });
+      stream.pipe(res);
+    })();
+  });
+}
+
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  if (!(await exists(path.join(ROOT, 'index.html')))) {
+    console.error('\n  dist/index.html is missing — run `npm run build` first.\n');
+    process.exit(1);
+  }
+  createServer().listen(PORT, HOST, () => {
+    const shown = HOST === '0.0.0.0' || HOST === '::' ? 'localhost' : HOST;
+    console.log(`  Romancha serving ${ROOT}`);
+    console.log(`  http://${shown}:${PORT}  (realtime API at /api/realtime/*)`);
+  });
+}

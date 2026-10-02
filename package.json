@@ -6,8 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "oxlint",
-    "preview": "vite preview"
+    "start": "node server/index.mjs",
+    "preview": "vite preview",
+    "lint": "oxlint src server",
+    "lint:fix": "oxlint src server --fix",
+    "test": "node --test tests/matching.test.mjs tests/datingStore.test.mjs",
+    "smoke": "node scripts/ssr-smoke.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
@@ -25,5 +29,8 @@
     "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "vite": "^8.3.0"
+  },
+  "engines": {
+    "node": ">=20.11"
   }
 }
