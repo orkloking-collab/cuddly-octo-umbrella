@@ -1,30 +1,33 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { attachRealtime } from './server/realtimeApi.mjs'
+import { createBackend } from './server/backend.mjs'
 
 /**
  * Romancha dev/preview config.
  *
- * The realtime hub lives in server/realtimeApi.mjs so the exact same API exists
- * in dev (`vite`), in preview (`vite preview`) and in production (`npm start`).
- * It used to be copy-pasted middleware inside this file, which meant a production
- * build had no backend at all.
+ * The backend (realtime hub + domain API + SQLite/Postgres) lives in server/ and is
+ * mounted identically here and in `server/index.mjs`, so `npm run dev`, `npm run
+ * preview` and `npm start` exercise the same routes instead of the app silently
+ * falling back to mock mode in production.
+ *
+ * configureServer is async on purpose: Vite awaits it, which lets the database
+ * finish migrating before the first request is served.
  */
-function realtimePlugin() {
-  return {
-    name: 'romancha-realtime-hub',
-    configureServer(server) {
-      attachRealtime(server)
-    },
-    configurePreviewServer(server) {
-      attachRealtime(server)
-    },
+function romanchaBackend() {
+  const mount = async (server) => {
+    const backend = await createBackend({ log: (msg, err) => server.config.logger.error(msg, err || '') })
+    server.middlewares.use((req, res, next) => backend.handle(req, res, next))
+    server.httpServer?.on('close', () => backend.close())
+    // Vite treats anything *returned* from configureServer as a post hook, so
+    // this hook must resolve to undefined (returning the backend broke startup).
+    server.__romancha = backend
   }
+  return { name: 'romancha-backend', configureServer: mount, configurePreviewServer: mount }
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), realtimePlugin()],
+  plugins: [react(), tailwindcss(), romanchaBackend()],
   server: {
     host: '0.0.0.0',
     port: 5173,

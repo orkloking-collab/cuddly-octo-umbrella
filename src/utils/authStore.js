@@ -1,4 +1,14 @@
 // Persistent Account Database & Auth System (Email + Password + Data Restoration)
+//
+// Two modes, and the difference matters:
+//   * server mode — credentials, sessions and lockouts live in the Romancha
+//     backend (scrypt hashes, httpOnly session cookies, DB-backed lockouts). The
+//     browser keeps only a mirror of the profile for rendering.
+//   * local mode — no API on this host (static build, file://). The old
+//     localStorage behaviour is kept so the prototype still works, with the same
+//     "never store a plaintext password" rule.
+import { serverSync } from './serverSync.js';
+import { datingStore } from './datingStore.js';
 const ACCOUNTS_STORAGE_KEY = 'romancha_accounts_database_v3';
 const CURRENT_SESSION_KEY = 'romancha_active_session_v2';
 const LOCKOUT_KEY = 'romancha_login_lockout_v1';
@@ -321,6 +331,114 @@ class AuthManager {
     this.saveActiveSession(null);
   }
 
+  // ------------------------------------------------------- server-backed auth
+  /**
+   * Sign in with the backend when there is one. Only a *missing* API falls back
+   * to local mode; a real 401/429 from the server is reported to the user as-is,
+   * because silently trying the local store would let a wrong password "succeed"
+   * against a stale demo account.
+   */
+  async signIn({ email, password } = {}) {
+    if (serverSync.mode !== 'local') {
+      const res = await serverSync.login({ email, password });
+      if (res.success) {
+        const merged = this.adoptServerUser(res.account);
+        return { success: true, account: merged, mode: 'server' };
+      }
+      if (res.status) return res;
+      serverSync.mode = 'local';
+    }
+    return this.login(email, password);
+  }
+
+  async signUp(userData = {}) {
+    if (serverSync.mode !== 'local') {
+      const res = await serverSync.register({
+        email: userData.email,
+        password: userData.password,
+        displayName: userData.name,
+      });
+      if (res.success) {
+        // Mirror the profile locally (name, avatar, ...) but never the password:
+        // the server is the only thing that knows it.
+        const email = String(userData.email || '').trim().toLowerCase();
+        if (email) {
+          this.accounts[email] = {
+            ...(this.accounts[email] || {}),
+            id: res.account.id,
+            email,
+            name: userData.name || res.account.displayName || 'Romantic Writer',
+            username: userData.username || `@${String(userData.name || 'writer').trim().toLowerCase().replace(/\s+/g, '_')}`,
+            gender: userData.gender || 'Female',
+            country: userData.country || 'Bangladesh',
+            countryFlag: userData.countryFlag || '🇧🇩',
+            avatar: userData.avatar || '',
+            bio: userData.bio || 'New on Romancha.',
+            socialLinks: userData.socialLinks || { instagram: '', twitter: '', website: '' },
+            role: 'Creator Member',
+            followers: 0,
+            following: 0,
+            publishedStories: [],
+            uploadedReels: [],
+            serverBacked: true,
+          };
+          this.saveAccounts();
+        }
+        const merged = this.adoptServerUser({ ...res.account, ...userData, id: res.account.id });
+        return { success: true, account: merged, mode: 'server' };
+      }
+      if (res.status) return res;
+      serverSync.mode = 'local';
+    }
+    return this.register(userData);
+  }
+
+  async signOut() {
+    await serverSync.logout();
+    this.logout();
+    return { success: true };
+  }
+
+  /** Mirror the account the server says we are, so the UI has a name/avatar. */
+  adoptServerUser(user) {
+    if (!user) return this.activeUser;
+    const email = String(user.email || '').toLowerCase();
+    const merged = {
+      ...(this.accounts[email] || {}),
+      id: user.id,
+      email,
+      name: user.displayName || user.name || 'Member',
+      serverBacked: true,
+    };
+    delete merged.password;
+    delete merged.passwordHash;
+    if (email) this.accounts[email] = merged;
+    this.saveAccounts();
+    this.activeUser = merged;
+    this.saveActiveSession(merged);
+    return merged;
+  }
+
+  /** Called once on boot: restores a server session and reports the mode. */
+  async bootstrap() {
+    const out = await serverSync.bootstrap(datingStore);
+    if (out?.mode === 'server') {
+      if (serverSync.user) this.adoptServerUser(serverSync.user);
+      else if (this.activeUser?.serverBacked) {
+        // The session cookie died (30 days, or a logout on another tab). A
+        // server-backed identity must not linger as a fake "signed in".
+        this.logout();
+      }
+      datingStore.setServerStatus({ mode: 'server', user: serverSync.user || null, error: serverSync.error });
+      serverSync.onChange((status) => datingStore.setServerStatus({
+        mode: status.mode, user: status.user, error: status.error, busy: status.busy,
+      }));
+    } else {
+      datingStore.setServerStatus({ mode: 'local' });
+    }
+    return out;
+  }
+
   updateProfile(updatedData) {
     if (!this.activeUser) {
       this.activeUser = updatedData;
@@ -370,6 +488,25 @@ class AuthManager {
 
   getActiveUser() {
     return this.getCurrentUser();
+  }
+
+  /**
+   * Demo identities, together with the password they were actually seeded with.
+   * The auth modal used to hard-code a password here, so the one-click button
+   * could log in with something nobody had set.
+   */
+  demoAccounts() {
+    return Object.values(this.accounts)
+      .filter((a) => a && a.demoPassword && a.email)
+      .slice(0, 4)
+      .map((a) => ({
+        email: a.email,
+        password: a.demoPassword,
+        name: a.name || a.email.split('@')[0],
+        avatar: a.avatar || '',
+        countryFlag: a.countryFlag || '🇧🇩',
+        gender: a.gender || 'Female',
+      }));
   }
 }
 

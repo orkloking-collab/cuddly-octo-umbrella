@@ -8,10 +8,11 @@
     "build": "vite build",
     "start": "node server/index.mjs",
     "preview": "vite preview",
-    "lint": "oxlint src server",
-    "lint:fix": "oxlint src server --fix",
-    "test": "node --test tests/matching.test.mjs tests/datingStore.test.mjs",
-    "smoke": "node scripts/ssr-smoke.mjs"
+    "lint": "oxlint src server tests scripts",
+    "lint:fix": "oxlint src server tests scripts --fix",
+    "test": "node --test tests/matching.test.mjs tests/datingStore.test.mjs tests/webrtcCall.test.mjs tests/server.test.mjs",
+    "smoke": "node scripts/ssr-smoke.mjs",
+    "db:reset": "node -e \"const f=process.env.ROMANCHA_DB||'data/romancha.db';require('node:fs').rmSync(f,{force:true});console.log('reset',f)\""
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

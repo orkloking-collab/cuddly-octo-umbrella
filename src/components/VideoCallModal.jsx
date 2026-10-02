@@ -1,164 +1,301 @@
-import React, { useState, useEffect } from 'react'
-import { PhoneOff, Mic, MicOff, Video, VideoOff, Heart, X } from 'lucide-react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  PhoneOff, Mic, MicOff, VideoOff, Heart, X, Loader2, PhoneIncoming,
+  ShieldAlert, Signal, Video as VideoIcon,
+} from 'lucide-react';
 import confetti from 'canvas-confetti';
+import { createPeerCall, peerAccountId } from '../utils/webrtcCall';
+import { realtimeHub } from '../utils/realtimeHub';
+import { datingStore } from '../utils/datingStore';
 
+/**
+ * A real 1:1 video date.
+ *
+ * Media never touches our server: the two browsers exchange SDP + ICE candidates
+ * through `/api/realtime/signal` (SSE in, POST out) and then stream peer to peer.
+ * That is why a demo persona cannot be called — there is no other browser on the
+ * line — and why the call cannot start over plain http (the browser will not hand
+ * out a camera).
+ */
 export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfile }) {
-  const [isMuted, setIsMuted] = useState(false);
-  const [isVideoOff, setIsVideoOff] = useState(false);
-  const [callDuration, setCallDuration] = useState(0);
-  const [callStatus, setCallStatus] = useState('Connecting secret encrypted line...');
+  const [callState, setCallState] = useState('idle');
+  const [failure, setFailure] = useState(null);
+  const [seconds, setSeconds] = useState(0);
+  const [muted, setMuted] = useState(false);
+  const [cameraOff, setCameraOff] = useState(false);
+  const [hearts, setHearts] = useState([]);
+  const [stats, setStats] = useState(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const callRef = useRef(null);
+  const startedRef = useRef(false);
+
+  const selfId = datingStore.getState().server?.user?.id || userProfile?.id || null;
+  const peerId = useMemo(() => peerAccountId(partnerUser?.id), [partnerUser?.id]);
+  const isRealPartner = Boolean(peerId) && String(partnerUser?.id || '').startsWith('usr:');
+  const partnerName = partnerUser?.name || 'Your match';
+
+  const close = useCallback(() => {
+    callRef.current?.hangUp();
+    callRef.current = null;
+    startedRef.current = false;
+    setSeconds(0);
+    setCallState('idle');
+    setFailure(null);
+    onClose?.();
+  }, [onClose]);
+
+  // Build the call once per open, so a re-render cannot renegotiate underneath us.
+  useEffect(() => {
+    if (!isOpen || !isRealPartner || !selfId || !peerId) return undefined;
+    if (startedRef.current) return undefined;
+    startedRef.current = true;
+
+    const call = createPeerCall({
+      selfId,
+      peerId,
+      sendSignal: ({ to, signal, callId }) => realtimeHub.sendSignal({ to, signal, callId }),
+      onStateChange: (next, info) => {
+        setCallState(next);
+        if (info) setFailure(typeof info === 'string' ? info : null);
+      },
+      onLocalStream: (stream) => {
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      },
+      onRemoteStream: (stream) => {
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+          remoteVideoRef.current.play?.().catch(() => { /* autoplay policy */ });
+        }
+      },
+      onReaction: (data) => {
+        if (data?.kind === 'heart') {
+          setHearts((prev) => [...prev.slice(-14), { id: `${data.ts}-${Math.random()}`, at: Date.now() }]);
+        }
+      },
+    });
+    callRef.current = call;
+
+    const off = realtimeHub.onSignal((payload) => {
+      if (payload.from !== peerId) return;
+      call.handleSignal(payload.signal);
+    });
+
+    // Whoever opened the modal is the caller; the other side is rung by the invite.
+    call.invite({ video: !cameraOff }).catch(() => setCallState('failed'));
+
+    return () => {
+      off();
+      call.close();
+      callRef.current = null;
+      startedRef.current = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed on the call target only
+  }, [isOpen, peerId, selfId, isRealPartner]);
+
+  // Hearts are transient; drop them so the overlay does not accumulate.
+  useEffect(() => {
+    if (!hearts.length) return undefined;
+    const t = setTimeout(() => setHearts((prev) => prev.filter((h) => Date.now() - h.at < 1800)), 1900);
+    return () => clearTimeout(t);
+  }, [hearts]);
+
+  // Call timer + a light stats poll (proof the media is actually flowing).
+  useEffect(() => {
+    if (callState !== 'connected') return undefined;
+    const tick = setInterval(() => setSeconds((s) => s + 1), 1000);
+    const poll = setInterval(async () => {
+      const out = await callRef.current?.getStats?.();
+      if (out) setStats(out);
+    }, 3000);
+    return () => {
+      clearInterval(tick);
+      clearInterval(poll);
+    };
+  }, [callState]);
 
   useEffect(() => {
-    let timer;
-    if (isOpen) {
-      setCallStatus('Connecting...');
-      const connectTimeout = setTimeout(() => {
-        setCallStatus('Connected • 1080p HD Private Line 🔒');
-        timer = setInterval(() => {
-          setCallDuration(prev => prev + 1);
-        }, 1000);
-      }, 1200);
-
-      return () => {
-        clearTimeout(connectTimeout);
-        clearInterval(timer);
-      };
-    } else {
-      setCallDuration(0);
-    }
-  }, [isOpen]);
+    if (!isOpen) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen, close]);
 
   if (!isOpen || !partnerUser) return null;
 
-  const formatTime = (secs) => {
-    const mins = Math.floor(secs / 60);
-    const rem = secs % 60;
-    return `${mins.toString().padStart(2, '0')}:${rem.toString().padStart(2, '0')}`;
+  const fmt = (secs) => `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
+
+  const statusLine = {
+    calling: `Ringing ${partnerName}…`,
+    incoming: `${partnerName} is calling`,
+    connecting: 'Opening the encrypted peer-to-peer path…',
+    connected: `Connected · p2p · ${fmt(seconds)}`,
+    failed: failureText(failure),
+    ended: 'Call ended',
+    idle: 'Getting your camera…',
+  }[callState] || 'Connecting…';
+
+  const toggleMic = () => {
+    const next = !muted;
+    setMuted(next);
+    callRef.current?.setAudio(!next);
   };
 
-  const handleSendHeartReaction = () => {
-    confetti({
-      particleCount: 30,
-      spread: 60,
-      origin: { y: 0.7 }
-    });
+  const toggleCam = () => {
+    const next = !cameraOff;
+    setCameraOff(next);
+    callRef.current?.setVideo(!next);
+  };
+
+  const sendHeart = () => {
+    const sent = callRef.current?.sendReaction('heart');
+    try {
+      confetti({ particleCount: sent ? 26 : 8, spread: 55, origin: { y: 0.75 }, colors: ['#fb7185', '#f472b6', '#fca5a5'] });
+    } catch { /* canvas unsupported */ }
+    if (sent) setHearts((prev) => [...prev.slice(-14), { id: `own-${Date.now()}`, at: Date.now(), own: true }]);
   };
 
   return (
-    <div className="fixed inset-0 z-60 bg-black/95 backdrop-blur-xl flex items-center justify-center p-0 sm:p-4 animate-fade-in">
-      
-      {/* Video Call Window */}
-      <div className="relative w-full h-full sm:max-w-4xl sm:h-[88vh] bg-[#120719] sm:rounded-3xl border-0 sm:border border-rose-500/40 shadow-2xl overflow-hidden flex flex-col justify-between">
-        
-        {/* Main Partner Video Stream */}
-        <div className="absolute inset-0">
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/95 p-0 backdrop-blur-xl sm:p-4">
+      <div className="relative flex h-full w-full flex-col justify-between overflow-hidden border-0 bg-[#0b0512] sm:h-[88vh] sm:max-w-4xl sm:rounded-3xl sm:border sm:border-rose-500/40">
+        {/* Remote feed: the whole point of the screen */}
+        <div className="absolute inset-0 bg-[#150a1e]">
           <video
-            src="https://assets.mixkit.co/videos/preview/mixkit-candles-in-the-dark-at-a-romantic-dinner-43527-large.mp4"
+            ref={remoteVideoRef}
             autoPlay
-            loop
-            muted={false}
             playsInline
-            className="w-full h-full object-cover"
+            className={`h-full w-full object-cover transition-opacity duration-500 ${callState === 'connected' ? 'opacity-100' : 'opacity-0'}`}
           />
-          <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-black/60 pointer-events-none" />
+          {callState !== 'connected' && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+              <img
+                src={partnerUser.avatar || partnerUser.photos?.[0]?.url || ''}
+                alt=""
+                className={`h-24 w-24 rounded-3xl object-cover shadow-2xl ${callState === 'calling' ? 'animate-pulse' : ''}`}
+              />
+              <p className="text-lg font-bold text-white">{partnerName}</p>
+              <p className="flex items-center gap-2 text-[12.5px] text-rose-100/70">
+                {(callState === 'calling' || callState === 'connecting' || callState === 'idle') && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                {statusLine}
+              </p>
+              {callState === 'failed' ? (
+                <div className="mt-1 max-w-sm rounded-xl border border-amber-400/30 bg-amber-950/30 p-3 text-left text-[12px] leading-relaxed text-amber-100">
+                  {failure === 'permission-denied' && 'You blocked camera/microphone access. Allow it in the address bar (the padlock), then call again.'}
+                  {failure === 'no-camera' && 'No camera found. You can still do a voice date — turn the camera off before calling.'}
+                  {failure === 'camera-in-use' && 'Another app (Meet, Zoom, Teams) holds the camera. Close it and retry.'}
+                  {(failure === 'peer-connection-failed' || failure === 'no-ice') && 'The two browsers could not find a path to each other. Move off a VPN or retry on mobile data — this build uses public STUN only, no TURN relay yet.'}
+                  {!failure && 'Something went wrong. End and try again.'}
+                </div>
+              ) : null}
+              {callState === 'incoming' && (
+                <div className="mt-3 flex gap-2">
+                  <button onClick={() => callRef.current?.decline()} className="rounded-xl bg-white/10 px-4 py-2.5 text-[13px] font-bold text-white hover:bg-white/20">Decline</button>
+                  <button onClick={() => callRef.current?.accept({ video: true })} className="flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-[13px] font-bold text-white hover:brightness-110">
+                    <PhoneIncoming className="h-4 w-4" /> Accept
+                  </button>
+                </div>
+              )}
+              {!isRealPartner && (
+                <div className="mt-2 max-w-sm rounded-xl border border-rose-400/30 bg-rose-950/40 p-3 text-left text-[12px] leading-relaxed text-rose-100">
+                  <ShieldAlert className="mb-1 h-4 w-4 text-rose-300" />
+                  {partnerName} is a seeded demo persona, so there is no second browser to connect to. Video dates run
+                  between two real accounts on the Romancha server — open a chat with a member you matched with instead.
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
-        {/* Top Call Info Bar */}
-        <div className="relative z-20 p-4 sm:p-6 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="relative">
-              <img
-                src={partnerUser.avatar}
-                alt={partnerUser.name}
-                className="w-12 h-12 rounded-2xl object-cover border-2 border-rose-500 shadow-xl"
-              />
-              <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-emerald-400 border-2 border-[#120719]"></span>
-            </div>
+        {/* Floating hearts from the data channel */}
+        {hearts.map((h, i) => (
+          <span
+            key={h.id}
+            className="pointer-events-none absolute bottom-24 text-2xl transition-transform duration-1000"
+            style={{ left: `${12 + ((i * 37) % 70)}%`, animation: 'romancha-float 1.6s ease-out forwards' }}
+          >
+            💗
+          </span>
+        ))}
 
+        {/* Top bar */}
+        <div className="relative z-20 flex items-start justify-between p-4 sm:p-5">
+          <div className="flex items-center gap-3 rounded-2xl bg-black/45 px-3 py-2 backdrop-blur">
+            <span className={`h-2 w-2 rounded-full ${callState === 'connected' ? 'bg-emerald-400' : callState === 'failed' ? 'bg-rose-500' : 'bg-amber-300'}`} />
             <div>
-              <div className="flex items-center gap-1.5">
-                <h3 className="text-base sm:text-lg font-bold font-serif text-white">{partnerUser.name}</h3>
-                <span>{partnerUser.countryFlag}</span>
-              </div>
-              <p className="text-xs text-emerald-400 font-mono">
-                {formatTime(callDuration)} • {callStatus}
-              </p>
+              <p className="text-[13px] font-bold leading-tight text-white">{partnerName}, {partnerUser.age ? `${partnerUser.age} · ` : ''}{partnerUser.city || ''}</p>
+              <p className="text-[11px] leading-tight text-emerald-300">{statusLine}</p>
             </div>
           </div>
-
-          <button
-            onClick={onClose}
-            className="p-2 rounded-full bg-black/50 text-white hover:bg-rose-600 transition-colors"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {callState === 'connected' && stats ? (
+              <span className="flex items-center gap-1.5 rounded-xl bg-black/45 px-2.5 py-1.5 text-[10.5px] text-rose-100/70 backdrop-blur">
+                <Signal className="h-3 w-3 text-emerald-400" />
+                {stats.inbound?.resolution || '—'} · {stats.rttMs != null ? `${stats.rttMs}ms` : 'p2p'} · {stats.candidateType || 'host'}
+              </span>
+            ) : null}
+            <button onClick={close} aria-label="Close video call" className="rounded-full bg-black/45 p-2 text-white backdrop-blur transition-colors hover:bg-rose-600">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
         </div>
 
-        {/* Small Self Camera Preview (Picture in Picture) */}
-        <div className="relative z-20 self-end mr-4 sm:mr-6 mb-4 w-28 h-40 sm:w-36 sm:h-52 rounded-2xl overflow-hidden border-2 border-rose-500/60 shadow-2xl bg-[#1b0d26]">
-          {isVideoOff ? (
-            <div className="w-full h-full flex flex-col items-center justify-center text-rose-300 text-xs">
-              <VideoOff className="w-6 h-6 mb-1 opacity-60" />
-              <span>Camera Off</span>
+        {/* Self preview */}
+        <div className="relative z-20 mb-2 mr-4 self-end overflow-hidden rounded-2xl border-2 border-rose-500/50 bg-[#1b0d26] shadow-2xl sm:mr-6">
+          <video ref={localVideoRef} autoPlay playsInline muted className={`h-40 w-28 object-cover sm:h-52 sm:w-36 ${cameraOff ? 'opacity-0' : ''}`} style={{ transform: 'scaleX(-1)' }} />
+          {cameraOff && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-rose-300">
+              <VideoOff className="h-5 w-5 opacity-70" />
+              <span className="text-[10px]">Camera off</span>
             </div>
-          ) : (
-            <img
-              src={userProfile?.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=300&q=80'}
-              alt="My camera"
-              className="w-full h-full object-cover"
-            />
           )}
-          <span className="absolute bottom-1 left-2 text-[10px] text-white font-bold drop-shadow">You</span>
+          <span className="absolute bottom-1 left-2 text-[10px] font-bold text-white drop-shadow">You</span>
         </div>
 
-        {/* Bottom Call Action Controls Bar */}
-        <div className="relative z-20 p-6 bg-gradient-to-t from-black via-black/80 to-transparent flex items-center justify-center gap-4 sm:gap-6">
-          
-          {/* Mute Button */}
+        {/* Controls */}
+        <div className="relative z-20 flex items-center justify-center gap-3 bg-gradient-to-t from-black via-black/80 to-transparent p-5 sm:gap-5 sm:p-6">
+          <RoundButton label={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={toggleMic} active={muted}>
+            {muted ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
+          </RoundButton>
+          <RoundButton label={cameraOff ? 'Turn camera on' : 'Turn camera off'} onClick={toggleCam} active={cameraOff}>
+            {cameraOff ? <VideoOff className="h-6 w-6" /> : <VideoIcon className="h-6 w-6" />}
+          </RoundButton>
+          <RoundButton label="Send a heart" onClick={sendHeart} tone="pink">
+            <Heart className="h-6 w-6 animate-bounce fill-current" />
+          </RoundButton>
           <button
-            onClick={() => setIsMuted(!isMuted)}
-            className={`p-4 rounded-full transition-all shadow-xl ${
-              isMuted ? 'bg-red-600 text-white' : 'bg-white/20 text-white hover:bg-white/30'
-            }`}
-            title={isMuted ? "Unmute" : "Mute"}
+            onClick={close}
+            className="flex items-center gap-2 rounded-full bg-red-600 px-5 py-4 font-bold text-white shadow-xl shadow-red-900/60 transition-all hover:bg-red-700 active:scale-95"
+            title="End call"
           >
-            {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+            <PhoneOff className="h-6 w-6" />
+            <span className="hidden text-xs sm:inline">End call</span>
           </button>
-
-          {/* Camera Toggle Button */}
-          <button
-            onClick={() => setIsVideoOff(!isVideoOff)}
-            className={`p-4 rounded-full transition-all shadow-xl ${
-              isVideoOff ? 'bg-red-600 text-white' : 'bg-white/20 text-white hover:bg-white/30'
-            }`}
-            title={isVideoOff ? "Turn Camera On" : "Turn Camera Off"}
-          >
-            {isVideoOff ? <VideoOff className="w-6 h-6" /> : <Video className="w-6 h-6" />}
-          </button>
-
-          {/* Heart Love Reaction Button */}
-          <button
-            onClick={handleSendHeartReaction}
-            className="p-4 rounded-full bg-pink-600 hover:bg-pink-500 text-white shadow-xl shadow-pink-600/50 hover:scale-115 active:scale-95 transition-all"
-            title="Send Heart Reaction"
-          >
-            <Heart className="w-6 h-6 fill-current animate-bounce" />
-          </button>
-
-          {/* End Call Button */}
-          <button
-            onClick={onClose}
-            className="p-4 px-6 rounded-full bg-red-600 hover:bg-red-700 text-white shadow-xl shadow-red-900/60 font-bold flex items-center gap-2 hover:scale-105 active:scale-95 transition-all"
-            title="End Video Call"
-          >
-            <PhoneOff className="w-6 h-6" />
-            <span className="hidden sm:inline text-xs">End Call</span>
-          </button>
-
         </div>
-
       </div>
-
     </div>
   );
+}
+
+function RoundButton({ children, onClick, label, active, tone }) {
+  return (
+    <button
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`rounded-full p-4 shadow-xl transition-all active:scale-95 ${
+        active ? 'bg-red-600 text-white' : tone === 'pink' ? 'bg-pink-600 text-white hover:bg-pink-500' : 'bg-white/20 text-white hover:bg-white/30'
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function failureText(failure) {
+  if (failure === 'permission-denied') return 'Camera and microphone permission was blocked';
+  if (failure === 'declined') return 'They did not pick up';
+  if (failure === 'busy') return 'They are on another call';
+  if (failure === 'remote-hangup') return 'The call ended';
+  if (failure === 'reconnecting') return 'Reconnecting…';
+  return 'Call failed';
 }

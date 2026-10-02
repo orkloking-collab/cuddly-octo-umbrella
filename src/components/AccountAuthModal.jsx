@@ -40,15 +40,20 @@ export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
     }
   };
 
-  const handleSubmit = (e) => {
+  // The seeded identities are read from the store instead of hard-coded here, so
+  // a demo button can never claim a password nobody set. Plain call, not a hook:
+  // this component returns early when closed and hooks must stay unconditional.
+  const demoAccounts = authStore.demoAccounts();
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setErrorMessage('');
     setSuccessMessage('');
     setLoading(true);
 
-    setTimeout(() => {
+    {
       if (authMode === 'signup') {
-        const result = authStore.register({
+        const result = await authStore.signUp({
           email,
           password,
           name,
@@ -66,7 +71,9 @@ export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
           return;
         }
 
-        setSuccessMessage('Account created successfully! Your stories and profile are now saved.');
+        setSuccessMessage(result.mode === 'server'
+          ? 'Account created — your profile is saved on the Romancha server and follows you to any device.'
+          : 'Account created on this device. Start Romancha with `npm run dev` to get server-backed accounts.');
         confetti({
           particleCount: 50,
           spread: 80,
@@ -81,7 +88,7 @@ export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
 
       } else {
         // Login mode
-        const result = authStore.login(email, password);
+        const result = await authStore.signIn({ email, password });
         if (!result.success) {
           setErrorMessage(result.error);
           setLoading(false);
@@ -101,13 +108,14 @@ export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
           onClose();
         }, 1200);
       }
-    }, 400);
+    }
   };
 
   // Demo 1-Click Fast Login for quick switching
   const handleQuickLoginAs = (demoEmail, demoPass) => {
     setEmail(demoEmail);
     setPassword(demoPass);
+    // Demo identities are device-local by design — they never touch the real API.
     const result = authStore.login(demoEmail, demoPass);
     if (result.success) {
       setSuccessMessage(`Switched to ID: ${result.account.name}`);
@@ -378,37 +386,25 @@ export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-xs">
-            <button
-              type="button"
-              onClick={() => handleQuickLoginAs('sophia@romancha.club', 'romance123')}
-              className="p-2 rounded-xl bg-[#12081a] hover:bg-rose-900/40 border border-rose-900/40 flex items-center gap-2 text-left transition-colors"
-            >
-              <img
-                src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=100&q=80"
-                alt="Sophia"
-                className="w-7 h-7 rounded-lg object-cover"
-              />
-              <div className="min-w-0 truncate">
-                <span className="text-[11px] text-white font-bold block truncate">Sophia Valentine</span>
-                <span className="text-[9px] text-rose-300">🇧🇩 Female Author</span>
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => handleQuickLoginAs('damiano@romancha.club', 'billionaire123')}
-              className="p-2 rounded-xl bg-[#12081a] hover:bg-rose-900/40 border border-rose-900/40 flex items-center gap-2 text-left transition-colors"
-            >
-              <img
-                src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=100&q=80"
-                alt="Damian"
-                className="w-7 h-7 rounded-lg object-cover"
-              />
-              <div className="min-w-0 truncate">
-                <span className="text-[11px] text-white font-bold block truncate">Damian Cross</span>
-                <span className="text-[9px] text-rose-300">🇬🇧 Male Creator</span>
-              </div>
-            </button>
+            {demoAccounts.map((demo) => (
+              <button
+                key={demo.email}
+                type="button"
+                onClick={() => handleQuickLoginAs(demo.email, demo.password)}
+                className="p-2 rounded-xl bg-[#12081a] hover:bg-rose-900/40 border border-rose-900/40 flex items-center gap-2 text-left transition-colors"
+                title="Demo profile: stored on this device only, never on the server"
+              >
+                {demo.avatar ? (
+                  <img src={demo.avatar} alt={demo.name} className="w-7 h-7 rounded-lg object-cover" />
+                ) : (
+                  <span className="w-7 h-7 rounded-lg bg-rose-900/50 grid place-items-center text-[13px]">{demo.name.slice(0, 1)}</span>
+                )}
+                <div className="min-w-0 truncate">
+                  <span className="text-[11px] text-white font-bold block truncate">{demo.name}</span>
+                  <span className="text-[9px] text-rose-300">{demo.countryFlag} {demo.gender} Author</span>
+                </div>
+              </button>
+            ))}
           </div>
         </div>
 

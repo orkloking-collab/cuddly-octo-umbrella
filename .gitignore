@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local SQLite databases for the dev/prod backend
+/data/
+*.db
+*.db-wal
+*.db-shm

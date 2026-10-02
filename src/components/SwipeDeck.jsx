@@ -66,6 +66,14 @@ export default function SwipeDeck({ onOpenChat, onOpenPremium, onOpenProfile, on
       setFlying(null);
       if (res.ok && res.matched) { celebrate(); setMatchPop(top); }
     }, 320);
+    // Real accounts are decided by the database, so the answer can arrive just
+    // after the card has flown off screen — celebrate then, not never.
+    if (res.pending && res.promise) {
+      res.promise.then((serverRes) => {
+        if (serverRes?.matched) { celebrate(); setMatchPop(top); }
+        else if (serverRes?.reason === 'out-of-likes') setOutOfLikes(true);
+      }).catch(() => { /* the store already recorded the error */ });
+    }
   }, [top, store, celebrate]);
 
   // Keyboard controls: this is the fastest way to actually use a dating app.

@@ -13,6 +13,7 @@
 
 import { buildDeck, FREE_DAILY_LIKES, SUPER_LIKES_PER_WEEK, profileStrength, likesBack } from './matching.js';
 import { datingProfiles } from '../data/datingProfiles.js';
+import { serverSync } from './serverSync.js';
 
 const STORAGE_KEY = 'romancha_dating_v1';
 const CHANNEL = 'romancha_dating_sync_v1';
@@ -69,6 +70,12 @@ const DEFAULT_STATE = {
   visitors: [],
   activity: [],
   settings: { sound: true, safetyNudge: true },
+  // Server-backed additions. `people` holds every real account the API has shown
+  // us (deck cards, matches, incoming likes) so a card id like `usr:<uuid>`
+  // resolves the same way a seeded persona does.
+  server: { mode: 'local', user: null, error: null, busy: 0 },
+  people: {},
+  incomingLikes: [],
 };
 
 function deepClone(obj) {
@@ -203,11 +210,24 @@ class DatingStore {
   updateProfile(patch) {
     const profile = { ...this.state.profile, ...patch };
     if (patch.photos) profile.photos = dedupeUrls(patch.photos).slice(0, 6);
-    return this.update({ profile, onboardedAt: this.state.onboardedAt || Date.now() });
+    const next = this.update({ profile, onboardedAt: this.state.onboardedAt || Date.now() });
+    this.syncProfileToServer();
+    return next;
   }
 
   updatePrefs(patch) {
-    return this.update((s) => ({ ...s, prefs: { ...s.prefs, ...patch } }));
+    const next = this.update((s) => ({ ...s, prefs: { ...s.prefs, ...patch } }));
+    this.syncProfileToServer();
+    return next;
+  }
+
+  /** Debounced mirror of profile + prefs; the server is the source for other devices. */
+  syncProfileToServer() {
+    clearTimeout(this.profileSyncTimer);
+    this.profileSyncTimer = setTimeout(() => {
+      const { profile, prefs } = this.state;
+      serverSync.saveProfile(profile, prefs);
+    }, 400);
   }
 
   strength() {
@@ -222,9 +242,82 @@ class DatingStore {
     return Boolean(this.state.premium);
   }
 
+  // ------------------------------------------------------- server bridge
+  /** A profile by card id: real account first, then the seeded personas. */
+  personById(id) {
+    return this.state.people?.[id] || datingProfiles.find((p) => p.id === id) || null;
+  }
+
+  isRemoteId(id) {
+    return String(id || '').startsWith('usr:');
+  }
+
+  /** Fold the backend snapshot into local state without discarding local chats. */
+  applyServerSnapshot(patch) {
+    const localConversations = this.state.conversations || {};
+    const conversations = { ...localConversations };
+    for (const [id, remote] of Object.entries(patch.conversations || {})) {
+      const local = localConversations[id];
+      if (!local?.messages?.length) {
+        conversations[id] = remote;
+        continue;
+      }
+      const localLast = local.messages[local.messages.length - 1];
+      const remoteExtra = (remote.messages || []).filter((m) => m.ts > (localLast?.ts || 0));
+      conversations[id] = {
+        ...local,
+        unread: remote.unread ?? local.unread ?? 0,
+        messages: remoteExtra.length ? [...local.messages, ...remoteExtra] : local.messages,
+      };
+    }
+
+    // Matches seen on another device must survive; ones we only know locally stay.
+    const seen = new Set((patch.matches || []).map((m) => m.profileId));
+    const keptLocal = (this.state.matches || []).filter((m) => !seen.has(m.profileId));
+    const matches = [...(patch.matches || []), ...keptLocal];
+
+    const server = { ...this.state.server, mode: patch.serverMode ? 'server' : 'local' };
+    delete patch.serverMode;
+
+    this.update({
+      ...this.state,
+      ...patch,
+      conversations,
+      matches,
+      profile: { ...this.state.profile, ...(patch.profile || {}) },
+      prefs: { ...this.state.prefs, ...(patch.prefs || {}) },
+      server,
+    });
+  }
+
+  noteServerEvent(event) {
+    const activity = [{ id: `a-srv-${event.at}-${Math.random().toString(36).slice(2, 6)}`, ...event }, ...(this.state.activity || [])].slice(0, 25);
+    this.update({ ...this.state, activity }, { silent: true });
+  }
+
+  /** A message that arrived over SSE from the backend (not the local mock). */
+  receiveRemoteMessage(profileId, message) {
+    if (!profileId || !message) return;
+    const thread = { ...this.thread(profileId) };
+    if (thread.messages.some((m) => m.id && m.id === message.id)) return;
+    thread.messages = [...thread.messages, { from: 'them', kind: 'text', ...message }];
+    thread.unread = (thread.unread || 0) + 1;
+    const matches = this.state.matches.map((m) => (m.profileId === profileId ? { ...m, expiresAt: null } : m));
+    this.update({ ...this.state, matches, conversations: { ...this.state.conversations, [profileId]: thread } });
+    this.noteServerEvent({ text: `${this.personById(profileId)?.name || 'Your match'} sent you a message.`, at: Date.now() });
+  }
+
+  setServerStatus(next) {
+    this.update({ ...this.state, server: { ...this.state.server, ...next } }, { silent: true });
+  }
+
   // --------------------------------------------------------------- deck
   candidates() {
-    return datingProfiles;
+    const extras = Object.values(this.state.people || {});
+    if (!extras.length) return datingProfiles;
+    const byId = new Map(datingProfiles.map((p) => [p.id, p]));
+    for (const p of extras) byId.set(p.id, { ...byId.get(p.id), ...p, isRealUser: String(p.id).startsWith('usr:') });
+    return Array.from(byId.values());
   }
 
   deck(options = {}) {
@@ -243,14 +336,18 @@ class DatingStore {
   pendingLikes() {
     const { decisions, matches, blocked } = this.state;
     const matched = new Set(matches.map((m) => m.profileId));
-    return datingProfiles.filter(
+    const people = this.candidates();
+    const remote = (this.state.incomingLikes || []).map((p) => ({ ...p, likesMe: true }));
+    const byId = new Map(people.map((p) => [p.id, p]));
+    for (const p of remote) byId.set(p.id, { ...byId.get(p.id), ...p, likesMe: true });
+    return Array.from(byId.values()).filter(
       (p) => p.likesMe && !decisions[p.id] && !matched.has(p.id) && !blocked.includes(p.id),
     );
   }
 
   // --------------------------------------------------------------- swiping
   swipe(profileId, kind = 'like') {
-    const profile = datingProfiles.find((p) => p.id === profileId);
+    const profile = this.personById(profileId);
     if (!profile) return { ok: false, reason: 'unknown-profile' };
 
     if (kind === 'like' && !this.canLike()) return { ok: false, reason: 'out-of-likes' };
@@ -266,9 +363,14 @@ class DatingStore {
 
     let matched = false;
     let matches = this.state.matches;
+    const remote = this.isRemoteId(profileId) && serverSync.mode === 'server';
     if (kind === 'like' || kind === 'super') {
-      const meForScoring = { ...this.state.profile, boosting: this.isBoosting() };
-      matched = likesBack(meForScoring, { ...profile, match: { sharedInterests: sharedWith(this.state.profile, profile) } }, kind);
+      // Real accounts decide in the database. A pending like from them is enough
+      // to match instantly; otherwise the server tells us a fraction of a second
+      // later and we patch the deck then (see `promise` below).
+      matched = remote
+        ? Boolean(profile.likesMe)
+        : likesBack({ ...this.state.profile, boosting: this.isBoosting() }, { ...profile, match: { sharedInterests: sharedWith(this.state.profile, profile) } }, kind);
       if (matched && !matches.some((m) => m.profileId === profileId)) {
         const now = Date.now();
         matches = [
@@ -283,6 +385,29 @@ class DatingStore {
     this.update({ ...this.state, decisions: decided, history, quota, superLikes, matches });
 
     if (matched) this.pushActivity(`You matched with ${profile.name} — say something better than "hey".`);
+
+    if (remote) {
+      const promise = serverSync.swipe(profileId, kind).then((res) => {
+        if (!res || res.error) {
+          this.setServerStatus({ error: res?.error || 'swipe not saved' });
+          if (res?.reason === 'out-of-likes') this.update({ ...this.state, quota: { ...this.state.quota, likes: FREE_DAILY_LIKES } });
+          return res;
+        }
+        serverSync.matchIds.set(profileId, res.matchId);
+        if (res.matched && !this.state.matches.some((m) => m.profileId === profileId)) {
+          const now = Date.now();
+          this.update({
+            ...this.state,
+            matches: [{ profileId, matchedAt: now, expiresAt: now + MATCH_WINDOW_HOURS * 3600_000, initiatedBy: 'you', person: res.counterpart }, ...this.state.matches],
+          });
+          this.ensureConversation(profileId);
+          this.pushActivity(`You matched with ${profile.name} — say something better than "hey".`);
+        }
+        if (res.quota) this.update({ ...this.state, quota: { day: today(), likes: res.quota.used, limit: res.quota.limit } });
+        return res;
+      });
+      return { ok: true, matched, profile, pending: true, promise };
+    }
     return { ok: true, matched, profile };
   }
 
@@ -293,6 +418,7 @@ class DatingStore {
     const decisions = { ...(last.prevDecisions || {}) };
     delete decisions[last.profileId];
     this.update({ ...this.state, decisions, history });
+    if (this.isRemoteId(last.profileId)) serverSync.undo(last.profileId);
     return { ok: true, profileId: last.profileId };
   }
 
@@ -334,6 +460,13 @@ class DatingStore {
       ? this.state.matches.map((m) => (m.profileId === profileId ? { ...m, expiresAt: null } : m))
       : this.state.matches;
     this.update({ ...this.state, matches, conversations: { ...this.state.conversations, [profileId]: thread } });
+    if (this.isRemoteId(profileId)) {
+      serverSync.message(profileId, msg.text, msg.kind).then((res) => {
+        if (res?.matchId) serverSync.matchIds.set(profileId, res.matchId);
+        if (res?.error && res?.skipped) this.setServerStatus({ error: 'This chat is local only — the match is not saved on the server yet.' });
+        else if (res?.error) this.setServerStatus({ error: res.error });
+      });
+    }
     return msg;
   }
 
@@ -348,6 +481,7 @@ class DatingStore {
     const thread = this.thread(profileId);
     if (!thread.unread) return;
     this.update({ ...this.state, conversations: { ...this.state.conversations, [profileId]: { ...thread, unread: 0 } } });
+    if (this.isRemoteId(profileId)) serverSync.markRead(profileId);
   }
 
   unreadTotal() {
@@ -367,7 +501,7 @@ class DatingStore {
     const now = Date.now();
     const rows = matches
       .map((m) => {
-        const person = datingProfiles.find((p) => p.id === m.profileId);
+        const person = this.personById(m.profileId) || m.person;
         const thread = conversations[m.profileId] || { messages: [], unread: 0 };
         const last = thread.messages[thread.messages.length - 1] || null;
         const hoursLeft = m.expiresAt ? Math.max(0, (m.expiresAt - now) / 3600_000) : null;
@@ -416,10 +550,12 @@ class DatingStore {
       blocked: [...this.state.blocked, profileId],
       decisions: { ...this.state.decisions, [profileId]: 'blocked' },
     });
+    serverSync.block(profileId);
   }
 
   unblock(profileId) {
     this.update({ ...this.state, blocked: this.state.blocked.filter((id) => id !== profileId) });
+    serverSync.unblock(profileId);
   }
 
   report(profileId, reason, detail = '') {
@@ -431,6 +567,7 @@ class DatingStore {
     });
     this.unmatch(profileId);
     this.block(profileId);
+    serverSync.report({ targetId: profileId, reason, detail });
     return entry;
   }
 
@@ -444,6 +581,46 @@ class DatingStore {
     return this.state.verification;
   }
 
+  /** Phone-number OTP: returns { ok } or { error } so the UI can show it inline. */
+  async requestPhoneOtp(phone) {
+    const res = await serverSync.requestPhoneOtp(phone);
+    if (res?.error) return { ok: false, error: res.error, debugCode: res.debugCode };
+    return { ok: true, phone: res.phone, expiresInSeconds: res.expiresInSeconds, debugCode: res.debugCode };
+  }
+
+  async confirmPhoneOtp(phone, code) {
+    const res = await serverSync.confirmPhoneOtp(phone, code);
+    if (res?.error) return { ok: false, error: res.error };
+    this.update((s) => ({
+      ...s,
+      verification: { ...s.verification, phoneVerified: true, phoneVerifiedAt: Date.now() },
+      server: { ...s.server, user: res.verification ? s.server.user : s.server.user },
+    }));
+    if (res.verification?.status === 'verified') this.completeVerification(true);
+    await serverSync.hydrate();
+    return { ok: true, verification: res.verification };
+  }
+
+  /**
+   * Selfie check that works in both modes: the backend queues/reports a real
+   * status, the local build falls back to "do you have a photo at all".
+   */
+  async verifySelfieNow() {
+    this.startVerification();
+    if (serverSync.mode === 'server') {
+      const res = await serverSync.verifySelfie();
+      if (res?.status === 'verified') {
+        this.completeVerification(true);
+        return { ok: true, verified: true };
+      }
+      if (res?.error) return { ok: false, error: res.error };
+      return { ok: true, verified: false, pending: true, note: res?.note };
+    }
+    const approved = (this.state.profile.photos?.length || 0) >= 1;
+    this.completeVerification(approved);
+    return { ok: approved, verified: approved, error: approved ? null : 'Add one clear face photo and retry.' };
+  }
+
   completeVerification(approved = true) {
     this.update((s) => ({
       ...s,
@@ -455,6 +632,7 @@ class DatingStore {
 
   setPremium(plan) {
     this.update({ ...this.state, premium: plan ? { plan, since: Date.now() } : null });
+    serverSync.setPremium(plan);
   }
 
   boost(hours = 0.5) {
@@ -469,7 +647,7 @@ class DatingStore {
   recordVisit(profileId) {
     const visitors = [{ profileId, at: Date.now() }, ...this.state.visitors.filter((v) => v.profileId !== profileId)].slice(0, 30);
     this.update({ ...this.state, visitors });
-    const name = datingProfiles.find((p) => p.id === profileId)?.name;
+    const name = this.personById(profileId)?.name;
     if (name) this.pushActivity(`You opened ${name}'s profile — they can see that visit if "last viewed" is on.`);
   }
 

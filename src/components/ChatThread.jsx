@@ -6,7 +6,6 @@ import {
 import SmartImage from './SmartImage';
 import { useDating, useDialog, useNow, timeAgo, formatCountdown } from '../utils/useDating';
 import { replyTo, matchOpener, suggestedReplies, staleness } from '../utils/chatEngine';
-import { datingProfiles } from '../data/datingProfiles';
 import { portraitTile } from '../utils/photoFallback';
 
 /**
@@ -16,13 +15,17 @@ import { portraitTile } from '../utils/photoFallback';
  * that actually changes state (blocked + removed from inbox).
  */
 export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSafety, onOpenProfile }) {
-  const { store, profile } = useDating();
+  const { store, profile, state } = useDating();
   const now = useNow(30000);
   const [draft, setDraft] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
   const [safeTimer, setSafeTimer] = useState(null);
   const listRef = useRef(null);
-  const them = useMemo(() => datingProfiles.find((p) => p.id === matchId), [matchId]);
+  // Real accounts live in `state.people` (hydrated from the server); personas in
+  // the bundled dataset. personById knows both, so one thread component serves
+  // scripted matches and genuine ones.
+  const them = useMemo(() => store.personById(matchId), [matchId, store, state.people]);
+  const isRealChat = store.isRemoteId(matchId) && state.server?.mode === 'server';
   const [thread, setThread] = useState(() => store.thread(matchId));
 
   useDialog(Boolean(matchId), onClose);
@@ -34,7 +37,10 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
   }, [store, matchId]);
 
   // Nudge them to open their mouth: real apps let the match message first ~60% of the time.
+  // Only for seeded personas — inventing an opener inside a *real* conversation
+  // would be putting words in another person's mouth.
   useEffect(() => {
+    if (isRealChat) return undefined;
     if (!them || thread.messages.length) return undefined;
     const opener = matchOpener(them, store.getProfile());
     if (!opener) return undefined;
@@ -44,7 +50,7 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
       store.appendMessage(matchId, { from: 'them', text: opener.text, kind: 'text' });
     }, opener.delayMs);
     return () => { store.setTyping(matchId, false); clearTimeout(t); };
-  }, [them, thread.messages.length, matchId, store]);
+  }, [them, thread.messages.length, matchId, store, isRealChat]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
@@ -65,8 +71,14 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
     const turn = thread.messages.filter((m) => m.from === 'me').length;
     store.sendText(matchId, clean);
     setDraft('');
+    if (isRealChat && store.getState().server?.error) {
+      // fall through: the optimistic bubble stays, the banner explains the retry
+    }
     const res = replyTo(clean, store.getProfile(), them, turn);
     if (res.kind === 'silence') return;
+    // A real member's reply arrives over SSE from the server. Fabricating a
+    // response here would be the single most damaging thing this app could do.
+    if (isRealChat) return;
     // Replies are intentionally NOT cancelled when this sheet closes: they land in
     // the store, which is what bumps the unread badge in the inbox. A dating chat
     // that only exists while you are looking at it is not a chat.
@@ -100,13 +112,18 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-bold text-white">{them.name}, {them.age}</p>
           <p className="truncate text-[11px] text-rose-100/60">
-            {thread.typing ? <span className="text-emerald-300">typing…</span> : them.online ? 'Online now' : `Active ${timeAgo(now - them.lastActiveMins * 60000, now)}`}
+            {thread.typing ? <span className="text-emerald-300">typing…</span> : them.online ? 'Online now' : isRealChat ? 'Real member · messages are saved on the server' : `Active ${timeAgo(now - (them.lastActiveMins ?? 0) * 60000, now)}`}
             {' · '}{them.city}
           </p>
         </div>
         {them.verified && <span className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-300">VERIFIED</span>}
         {store.getState().prefs.allowVideoCalls && (
-          <button onClick={() => onOpenVideoCall?.(them)} aria-label="Start video date" className="rounded-full p-2 text-rose-100 hover:bg-white/10"><Video className="h-4.5 w-4.5" /></button>
+          <button
+            onClick={() => onOpenVideoCall?.(them)}
+            aria-label="Start video date"
+            title={isRealChat ? 'Start a peer-to-peer video date' : 'Demo persona: video dates need a real member on the other side'}
+            className={`rounded-full p-2 hover:bg-white/10 ${isRealChat ? 'text-rose-100' : 'text-rose-100/40'}`}
+          ><Video className="h-4.5 w-4.5" /></button>
         )}
         <div className="relative">
           <button onClick={() => setMenuOpen((v) => !v)} aria-label="Conversation options" aria-expanded={menuOpen} className="rounded-full p-2 text-rose-100 hover:bg-white/10"><MoreVertical className="h-4.5 w-4.5" /></button>

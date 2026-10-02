@@ -148,6 +148,32 @@ export default function App() {
 
   const [soundState, setSoundState] = useState(null); // 'rain' | 'warm' | null
 
+  // Boot handshake with the backend: restore a real session, hydrate matching and
+  // chat from the database, and record whether this host has an API at all.
+  useEffect(() => {
+    let alive = true;
+    authStore
+      .bootstrap()
+      .then((out) => {
+        if (!alive) return;
+        if (out?.mode === 'server' && out.user) {
+          const u = authStore.getCurrentUser();
+          setCurrentUser(u);
+          setUserProfile((prev) => ({
+            ...prev,
+            id: u.id || prev.id,
+            name: u.name || prev.name,
+            email: u.email || prev.email,
+          }));
+        }
+      })
+      .catch((err) => {
+        if (!alive) return;
+        datingStore.setServerStatus({ mode: 'local', error: err?.message || 'backend unreachable' });
+      });
+    return () => { alive = false; };
+  }, []);
+
   // Save to localStorage
   useEffect(() => {
     localStorage.setItem('romancha_v5_stories', JSON.stringify(stories));

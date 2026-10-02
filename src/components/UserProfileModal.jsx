@@ -139,7 +139,9 @@ export default function UserProfileModal({ isOpen, onClose, userProfile, onSaveP
             <button
               type="button"
               onClick={() => {
-                authStore.logout();
+                // Sign out of the server too, or a reload would silently
+                // put you straight back in via the session cookie.
+                authStore.signOut();
                 if (onLogout) onLogout();
                 onClose();
               }}

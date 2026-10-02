@@ -38,6 +38,9 @@ if (!globalThis.navigator?.geolocation) {
   });
 }
 
+// The shared Vite config mounts the real backend; keep its database in memory so
+// a render smoke test never writes a file into the repo.
+process.env.ROMANCHA_DB = ':memory:';
 const vite = await createServer({ server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
 
 const failures = [];
@@ -71,6 +74,8 @@ try {
     ['OnboardingWizard', '/src/components/OnboardingWizard.jsx'],
     ['PremiumSheet', '/src/components/PremiumSheet.jsx'],
     ['ChatThread', '/src/components/ChatThread.jsx'],
+    ['VideoCallModal (closed)', '/src/components/VideoCallModal.jsx'],
+    ['PhoneVerifyPanel', '/src/components/PhoneVerifyPanel.jsx'],
     ['AgeGate', '/src/components/AgeGate.jsx'],
     ['MatchFilters', '/src/components/MatchFilters.jsx'],
     ['ReelsVideoFeed', '/src/components/ReelsVideoFeed.jsx'],
@@ -94,6 +99,9 @@ try {
       OnboardingWizard: { open: true, onClose: () => {}, onComplete: () => {} },
       PremiumSheet: { open: true, onClose: () => {} },
       ChatThread: { matchId: 'dl-aisha_karim', onClose: () => {} },
+      // isOpen=false must render nothing without touching getUserMedia.
+      'VideoCallModal (closed)': { isOpen: false, onClose: () => {}, partnerUser: null, userProfile: {} },
+      PhoneVerifyPanel: {},
       AgeGate: {},
       MatchFilters: { open: true, onClose: () => {}, prefs: { ageMin: 20, ageMax: 45, distanceKm: 500 } },
       ReelsVideoFeed: { followingAuthors: [], onToggleFollow: () => {}, userProfile: {} },

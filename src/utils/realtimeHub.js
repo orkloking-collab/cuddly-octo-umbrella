@@ -10,6 +10,8 @@ class RealtimeChatHub {
     this.profileListeners = new Set();
     this.giftListeners = new Set();
     this.presenceListeners = new Set();
+    this.signalListeners = new Set();
+    this.domainListeners = new Set();
     this.isConnected = false;
     this.serverAvailable = null; // null = unknown, false = static hosting (no /api) -> stay local-only
     this.currentUser = null;
@@ -50,7 +52,9 @@ class RealtimeChatHub {
         try { this.eventSource.close(); } catch {}
       }
 
-      this.eventSource = new EventSource('/api/realtime/stream');
+      // `uid` lets the server push a DM or a WebRTC offer to *this* tab only.
+      const uid = this.currentUser?.id ? `?uid=${encodeURIComponent(this.currentUser.id)}` : '';
+      this.eventSource = new EventSource(`/api/realtime/stream${uid}`);
 
       this.eventSource.onopen = () => {
         this.isConnected = true;
@@ -80,6 +84,12 @@ class RealtimeChatHub {
             if (payload.onlineMembers) this.notifyPresence(payload.onlineMembers);
           } else if (payload.type === 'presence') {
             this.notifyPresence(payload.onlineMembers);
+          } else if (payload.type === 'signal') {
+            // WebRTC offer / answer / ICE candidate, relayed verbatim.
+            this.signalListeners.forEach((cb) => { try { cb(payload); } catch {} });
+          } else if (payload.type === 'chat' || payload.type === 'match') {
+            // Server-side (database-backed) events, consumed by datingStore.
+            this.domainListeners.forEach((cb) => { try { cb(payload); } catch {} });
           }
         } catch (e) {
           console.error('Error parsing SSE event', e);
@@ -108,11 +118,35 @@ class RealtimeChatHub {
   }
 
   setUser(user) {
-    this.currentUser = user;
+    const changed = (user?.id || null) !== (this.currentUser?.id || null);
+    this.currentUser = user || null;
     this.sendPresence();
 
     if (!this.pingInterval) {
       this.pingInterval = setInterval(() => this.sendPresence(), 15000);
+    }
+    // Sign-in changes who the targeted pushes (chat, call invites) belong to.
+    if (changed && this.serverAvailable !== false) this.connectSSE();
+  }
+
+  /** Relays SDP/ICE blobs to one peer. The server never touches media. */
+  async sendSignal({ to, signal, callId }) {
+    if (this.serverAvailable === false) return { success: false, error: 'offline' };
+    try {
+      const res = await fetch('/api/realtime/signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to,
+          from: this.currentUser?.id || 'anon',
+          callId: callId || null,
+          signal,
+        }),
+      });
+      if (!res.ok) return { success: false, status: res.status };
+      return await res.json();
+    } catch (e) {
+      return { success: false, error: e?.name || 'network' };
     }
   }
 
@@ -239,6 +273,8 @@ class RealtimeChatHub {
   onFeedback(cb) { this.feedbackListeners.add(cb); return () => this.feedbackListeners.delete(cb); }
   onGift(cb) { this.giftListeners.add(cb); return () => this.giftListeners.delete(cb); }
   onPresence(cb) { this.presenceListeners.add(cb); return () => this.presenceListeners.delete(cb); }
+  onSignal(cb) { this.signalListeners.add(cb); return () => this.signalListeners.delete(cb); }
+  onDomain(cb) { this.domainListeners.add(cb); return () => this.domainListeners.delete(cb); }
 
   subscribeMessages(cb) { return this.onMessage(cb); }
   subscribeStories(cb) { return this.onStory(cb); }

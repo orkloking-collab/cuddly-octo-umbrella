@@ -11,6 +11,33 @@
 
 export function createRealtimeStore({ maxHistory = 250, maxFeed = 60, presenceTimeoutMs = 35_000 } = {}) {
   const clients = new Set();
+  /** userId -> Set<res>. Populated from the stream query (`?uid=`) so we can
+   *  push a DM or a WebRTC offer to exactly one person, not to the whole room. */
+  const byUser = new Map();
+  const uidOf = new Map();
+
+  const attachUser = (res, uid) => {
+    if (!uid) return;
+    uidOf.set(res, uid);
+    if (!byUser.has(uid)) byUser.set(uid, new Set());
+    byUser.get(uid).add(res);
+  };
+  const detachUser = (res) => {
+    const uid = uidOf.get(res);
+    if (!uid) return;
+    byUser.get(uid)?.delete(res);
+    if (!byUser.get(uid)?.size) byUser.delete(uid);
+    uidOf.delete(res);
+  };
+  const sendTo = (uid, obj) => {
+    const set = byUser.get(uid);
+    if (!set?.size) return false;
+    const frame = `data: ${JSON.stringify(obj)}\n\n`;
+    for (const res of set) {
+      try { res.write(frame); } catch { set.delete(res); }
+    }
+    return true;
+  };
   const messageHistory = [];
   const liveStories = [];
   const liveReels = [];
@@ -60,6 +87,7 @@ export function createRealtimeStore({ maxHistory = 250, maxFeed = 60, presenceTi
 
   const handlers = {
     stream(req, res) {
+      const uid = new URL(req.url || '/api/realtime/stream', 'http://x').searchParams.get('uid');
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache, no-transform',
@@ -69,8 +97,34 @@ export function createRealtimeStore({ maxHistory = 250, maxFeed = 60, presenceTi
       });
       res.write(': open\n\n');
       clients.add(res);
+      attachUser(res, uid);
       res.write(`data: ${JSON.stringify(initialPayload())}\n\n`);
-      req.on('close', () => clients.delete(res));
+      req.on('close', () => {
+        clients.delete(res);
+        detachUser(res);
+      });
+    },
+
+    /**
+     * WebRTC / DM signalling: relay an SDP offer, answer or ICE candidate to one
+     * user. The server never sees media — only the opaque signal blobs two peers
+     * exchange, and it is not persisted to history.
+     */
+    signal(req, res) {
+      readJson(req)
+        .then((payload) => {
+          const to = String(payload.to || '');
+          if (!to) return json(res, 400, { error: 'missing "to"' });
+          const delivered = sendTo(to, {
+            type: 'signal',
+            from: String(payload.from || ''),
+            signal: payload.signal || null,
+            callId: payload.callId || null,
+            at: Date.now(),
+          });
+          json(res, 200, { success: true, delivered });
+        })
+        .catch((err) => json(res, 400, { error: err.message }));
     },
 
     publish(req, res) {
@@ -171,7 +225,12 @@ export function createRealtimeStore({ maxHistory = 250, maxFeed = 60, presenceTi
     },
   };
 
-  return { handlers, store: { messageHistory, liveStories, onlineLiveMembers } };
+  return {
+    handlers,
+    sendTo,
+    onlineUsers: () => Array.from(byUser.keys()),
+    store: { messageHistory, liveStories, onlineLiveMembers },
+  };
 }
 
 /** Wrap the handlers as connect-style middleware for `vite configureServer`. */
@@ -181,7 +240,9 @@ export function attachRealtime(server) {
   route('/api/realtime/stream', handlers.stream);
   route('/api/realtime/publish', requireMethod('POST', handlers.publish));
   route('/api/realtime/presence', requireMethod('POST', handlers.presence));
+  route('/api/realtime/signal', requireMethod('POST', handlers.signal));
   route('/api/realtime/health', handlers.health);
+  return { handlers };
 }
 
 function requireMethod(method, handler) {

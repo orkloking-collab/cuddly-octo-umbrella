@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import SmartImage from './SmartImage';
 import { useDating, useNow, timeAgo } from '../utils/useDating';
+import PhoneVerifyPanel from './PhoneVerifyPanel';
 import { datingProfiles } from '../data/datingProfiles';
 
 const TABS = [
@@ -40,20 +41,23 @@ export default function SafetyCentre({ open, onClose, targetProfile = null }) {
   const [reason, setReason] = useState(REPORT_REASONS[0]);
   const [detail, setDetail] = useState('');
   const [flash, setFlash] = useState('');
+  const [verifying, setVerifying] = useState(false);
   const state = store.getState();
 
   if (!open) return null;
 
   const say = (msg) => { setFlash(msg); setTimeout(() => setFlash(''), 4200); };
 
-  const verify = () => {
-    store.startVerification();
+  const verify = async () => {
+    setVerifying(true);
     say('Selfie received — checking it against your photos…');
-    setTimeout(() => {
-      const approved = (profile.photos?.length || 0) >= 1;
-      store.completeVerification(approved);
-      say(approved ? 'Verified ✅ Your badge is live and verified-only users can see you.' : 'We could not compare your selfie to your photos. Add one clear face photo and retry.');
-    }, 2200);
+    // On the server this is a real queue: pending, then approved once the phone
+    // number is confirmed. Locally we fall back to the old heuristic.
+    const out = await store.verifySelfieNow();
+    setVerifying(false);
+    if (out.ok && out.verified) say('Verified ✅ Your badge is live and verified-only users can see you.');
+    else if (out.pending) say(out.note || 'Queued for review — we will flip the badge on as soon as it clears.');
+    else say(out.error || 'We could not compare your selfie to your photos. Add one clear face photo and retry.');
   };
 
   const submitReport = () => {
@@ -115,11 +119,23 @@ export default function SafetyCentre({ open, onClose, targetProfile = null }) {
                   after the comparison — it is never used for anything else.
                 </p>
                 {state.verification.status !== 'verified' && (
-                  <button onClick={verify} className="mt-3 flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2.5 text-[13px] font-bold text-white hover:brightness-110">
-                    <Camera className="h-4 w-4" /> {state.verification.status === 'pending' ? 'Retry verification' : 'Verify with a selfie'}
+                  <button onClick={verify} disabled={verifying} className="mt-3 flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2.5 text-[13px] font-bold text-white hover:brightness-110 disabled:opacity-60">
+                    <Camera className="h-4 w-4" /> {verifying ? 'Checking…' : state.verification.status === 'pending' ? 'Retry verification' : 'Verify with a selfie'}
                   </button>
                 )}
                 <p className="mt-2 text-[11px] text-rose-100/40">Age gate: {profile.age ? `${profile.age} years old, confirmed at signup` : 'not set'}. Under-18 accounts are removed on report, no appeal.</p>
+              </div>
+
+              <PhoneVerifyPanel />
+
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-white/8 bg-white/[0.02] px-3 py-2 text-[11px] text-rose-100/55">
+                <span className="font-semibold text-white/70">
+                  {state.server?.mode === 'server' ? 'Saved on the Romancha server' : 'Saved in this browser only'}
+                </span>
+                {state.server?.mode === 'server'
+                  ? <>· swipes, chats and reports sync across your devices</>
+                  : <>· start <code className="rounded bg-black/40 px-1">npm run dev</code> for accounts, chats and verification on a real backend</>}
+                {state.server?.error ? <span className="text-amber-300">· last sync problem: {state.server.error}</span> : null}
               </div>
 
               {targetProfile && (

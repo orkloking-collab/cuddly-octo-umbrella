@@ -9,7 +9,7 @@ import http from 'node:http';
 import { createReadStream, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRealtimeStore } from './realtimeApi.mjs';
+import { createBackend } from './backend.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 const PORT = Number(process.env.PORT || 3000);
@@ -32,7 +32,9 @@ const BASE_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'no-referrer',
-  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(self), interest-cohort=()',
+  // Camera/mic are allowed for the origin itself: 1:1 video dates need
+  // getUserMedia. Everything else (autoplay excluded) stays locked down.
+  'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=(self), display-capture=(), interest-cohort=()',
   'Cross-Origin-Opener-Policy': 'same-origin',
 };
 
@@ -45,26 +47,29 @@ async function exists(file) {
   }
 }
 
-export function createServer() {
-  const { handlers } = createRealtimeStore();
-
+export function createServer(backend) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const route = url.pathname;
 
-    if (route.startsWith('/api/realtime/')) {
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type' });
-        res.end();
-        return;
+    // /api/* is entirely the backend's business (realtime hub + domain routes).
+    if (route.startsWith('/api/')) {
+      if (!backend) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'backend unavailable' }));
+        return undefined;
       }
-      if (route === '/api/realtime/stream') return handlers.stream(req, res);
-      if (route === '/api/realtime/publish' && req.method === 'POST') return handlers.publish(req, res);
-      if (route === '/api/realtime/presence' && req.method === 'POST') return handlers.presence(req, res);
-      if (route === '/api/realtime/health') return handlers.health(req, res);
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'unknown endpoint' }));
-      return;
+      backend.handle(req, res, () => {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unknown endpoint' }));
+      });
+      return undefined;
+    }
+
+    if (backend && (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE')) {
+      res.writeHead(405, BASE_HEADERS);
+      res.end();
+      return undefined;
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -114,9 +119,10 @@ if (isDirectRun) {
     console.error('\n  dist/index.html is missing — run `npm run build` first.\n');
     process.exit(1);
   }
-  createServer().listen(PORT, HOST, () => {
+  const backend = await createBackend();
+  createServer(backend).listen(PORT, HOST, () => {
     const shown = HOST === '0.0.0.0' || HOST === '::' ? 'localhost' : HOST;
     console.log(`  Romancha serving ${ROOT}`);
-    console.log(`  http://${shown}:${PORT}  (realtime API at /api/realtime/*)`);
+    console.log(`  http://${shown}:${PORT}  (API: /api/*, storage: ${backend.db.kind})`);
   });
 }
