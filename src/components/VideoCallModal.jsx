@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   PhoneOff, Mic, MicOff, VideoOff, Heart, X, Loader2, PhoneIncoming,
-  ShieldAlert, Signal, Video as VideoIcon,
+  ShieldAlert, Signal, Video as VideoIcon, Clock,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { createPeerCall, peerAccountId } from '../utils/webrtcCall';
@@ -17,7 +17,7 @@ import { datingStore } from '../utils/datingStore';
  * line — and why the call cannot start over plain http (the browser will not hand
  * out a camera).
  */
-export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfile }) {
+export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfile, onOpenPremium }) {
   const [callState, setCallState] = useState('idle');
   const [failure, setFailure] = useState(null);
   const [seconds, setSeconds] = useState(0);
@@ -25,10 +25,18 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
   const [cameraOff, setCameraOff] = useState(false);
   const [hearts, setHearts] = useState([]);
   const [stats, setStats] = useState(null);
+  // Video minutes are a product decision, not a courtesy: free accounts get a
+  // fixed allowance per 24h and the server hands out the number, so this modal
+  // only ever displays what the API already allowed.
+  const [gate, setGate] = useState('idle'); // idle | checking | ok | denied
+  const [budget, setBudget] = useState(null); // { secondsLeft, plan, localOnly, resetsAt }
+  const [denied, setDenied] = useState(null);
+  const [overQuota, setOverQuota] = useState(false);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const callRef = useRef(null);
   const startedRef = useRef(false);
+  const secondsRef = useRef(0);
 
   const selfId = datingStore.getState().server?.user?.id || userProfile?.id || null;
   const peerId = useMemo(() => peerAccountId(partnerUser?.id), [partnerUser?.id]);
@@ -42,12 +50,49 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
     setSeconds(0);
     setCallState('idle');
     setFailure(null);
+    setOverQuota(false);
+    if (datingStore.getState().call?.sessionId) {
+      if (datingStore.getState().call?.plan === 'local') datingStore.addLocalCallSeconds(secondsRef.current);
+      datingStore.releaseCall();
+    }
     onClose?.();
   }, [onClose]);
+
+  // Ask the server for permission (and a session id to bill against) before the
+  // camera even opens — no point warming a call that is not paid for.
+  useEffect(() => {
+    if (!isOpen) {
+      setGate('idle');
+      setDenied(null);
+      return undefined;
+    }
+    if (!isRealPartner) {
+      setGate('ok'); // persona / demo path: nothing to meter against
+      return undefined;
+    }
+    let cancelled = false;
+    setGate('checking');
+    setDenied(null);
+    datingStore.reserveCall(partnerUser?.id).then((out) => {
+      if (cancelled) {
+        if (out?.ok) datingStore.releaseCall();
+        return;
+      }
+      if (!out?.ok) {
+        setDenied(out);
+        setGate('denied');
+        return;
+      }
+      setBudget({ secondsLeft: out.secondsLeft ?? null, plan: out.plan, localOnly: Boolean(out.localOnly), resetsAt: out.resetsAt });
+      setGate('ok');
+    });
+    return () => { cancelled = true; };
+  }, [isOpen, isRealPartner, partnerUser?.id]);
 
   // Build the call once per open, so a re-render cannot renegotiate underneath us.
   useEffect(() => {
     if (!isOpen || !isRealPartner || !selfId || !peerId) return undefined;
+    if (gate !== 'ok') return undefined;
     if (startedRef.current) return undefined;
     startedRef.current = true;
 
@@ -91,7 +136,7 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
       startedRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed on the call target only
-  }, [isOpen, peerId, selfId, isRealPartner]);
+  }, [isOpen, peerId, selfId, isRealPartner, gate]);
 
   // Hearts are transient; drop them so the overlay does not accumulate.
   useEffect(() => {
@@ -103,7 +148,7 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
   // Call timer + a light stats poll (proof the media is actually flowing).
   useEffect(() => {
     if (callState !== 'connected') return undefined;
-    const tick = setInterval(() => setSeconds((s) => s + 1), 1000);
+    const tick = setInterval(() => setSeconds((s) => { secondsRef.current = s + 1; return s + 1; }), 1000);
     const poll = setInterval(async () => {
       const out = await callRef.current?.getStats?.();
       if (out) setStats(out);
@@ -114,6 +159,31 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
     };
   }, [callState]);
 
+  // Bill the call: heartbeat every 20s so the server knows we are still in it, and
+  // hang up when the allowance runs out instead of letting it cut mid-sentence.
+  useEffect(() => {
+    if (callState !== 'connected' || gate !== 'ok' || budget?.localOnly) return undefined;
+    let dead = false;
+    const beat = setInterval(async () => {
+      const res = await datingApiCallHeartbeat();
+      if (dead) return;
+      if (res?.ok) {
+        setBudget((prev) => ({ ...(prev || {}), secondsLeft: res.secondsLeft, usedSeconds: res.usedSeconds, limitSeconds: res.limitSeconds }));
+        if ((res.secondsLeft ?? 0) <= 0) setOverQuota(true);
+      }
+    }, 20000);
+    return () => { dead = true; clearInterval(beat); };
+  }, [callState, gate, budget?.localOnly]);
+
+  useEffect(() => {
+    if (!overQuota || callState !== 'connected') return undefined;
+    const t = setTimeout(() => {
+      callRef.current?.hangUp?.();
+      close();
+    }, 20000);
+    return () => clearTimeout(t);
+  }, [overQuota, callState, close]);
+
   useEffect(() => {
     if (!isOpen) return undefined;
     const onKey = (e) => { if (e.key === 'Escape') close(); };
@@ -121,11 +191,20 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
     return () => document.removeEventListener('keydown', onKey);
   }, [isOpen, close]);
 
+  async function datingApiCallHeartbeat() {
+    try {
+      const { serverSync } = await import('../utils/serverSync.js');
+      return await serverSync.heartbeatCall(datingStore.getState().call?.sessionId);
+    } catch {
+      return { ok: false };
+    }
+  }
+
   if (!isOpen || !partnerUser) return null;
 
   const fmt = (secs) => `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 
-  const statusLine = {
+  const statusLine = gate === 'checking' ? 'Checking your call minutes…' : {
     calling: `Ringing ${partnerName}…`,
     incoming: `${partnerName} is calling`,
     connecting: 'Opening the encrypted peer-to-peer path…',
@@ -158,6 +237,28 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/95 p-0 backdrop-blur-xl sm:p-4">
       <div className="relative flex h-full w-full flex-col justify-between overflow-hidden border-0 bg-[#0b0512] sm:h-[88vh] sm:max-w-4xl sm:rounded-3xl sm:border sm:border-rose-500/40">
+        {gate === 'denied' && (
+          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-4 bg-[#0b0512] px-6 text-center">
+            <span className="grid h-14 w-14 place-items-center rounded-full bg-amber-500/15 text-amber-300"><Clock className="h-6 w-6" /></span>
+            <div>
+              <p className="text-lg font-bold text-white">Your free video minutes are used up</p>
+              <p className="mx-auto mt-2 max-w-sm text-[13px] leading-relaxed text-rose-100/70">
+                Every account gets {fmt(Math.round((denied?.limitSeconds || 1200)))} of video calling per 24 hours, and the clock is kept by
+                the server — a second tab does not get you more.
+                {denied?.resetsAt ? ` Yours resets at ${new Date(denied.resetsAt).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}.` : ' Text chat stays unlimited.'}
+              </p>
+            </div>
+            {onOpenPremium && (
+              <button
+                onClick={() => { close(); onOpenPremium?.(); }}
+                className="rounded-full bg-gradient-to-r from-rose-600 to-pink-600 px-5 py-2.5 text-sm font-bold text-white"
+              >
+                $1 gets you 2 hours a day
+              </button>
+            )}
+            <button onClick={close} className="text-[12.5px] text-rose-100/60 underline">Back to the chat</button>
+          </div>
+        )}
         {/* Remote feed: the whole point of the screen */}
         <div className="absolute inset-0 bg-[#150a1e]">
           <video
@@ -224,9 +325,20 @@ export default function VideoCallModal({ isOpen, onClose, partnerUser, userProfi
             <div>
               <p className="text-[13px] font-bold leading-tight text-white">{partnerName}, {partnerUser.age ? `${partnerUser.age} · ` : ''}{partnerUser.city || ''}</p>
               <p className="text-[11px] leading-tight text-emerald-300">{statusLine}</p>
+              {overQuota && (
+                <p className="mt-1 max-w-[240px] text-left text-[10.5px] leading-snug text-amber-200">
+                  Out of minutes — this call closes in a few seconds. Say your goodbyes, or unlock 2 hours a day for $1.
+                </p>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {gate === 'ok' && budget?.secondsLeft != null && (
+              <span className={`rounded-xl px-2.5 py-1.5 text-[10.5px] font-semibold backdrop-blur ${budget.secondsLeft < 120 ? 'bg-amber-500/25 text-amber-100' : 'bg-black/45 text-rose-100/75'}`}>
+                {fmt(budget.secondsLeft)} left today
+                {budget.plan === 'free' ? ' · free' : ` · ${budget.plan}`}
+              </span>
+            )}
             {callState === 'connected' && stats ? (
               <span className="flex items-center gap-1.5 rounded-xl bg-black/45 px-2.5 py-1.5 text-[10.5px] text-rose-100/70 backdrop-blur">
                 <Signal className="h-3 w-3 text-emerald-400" />

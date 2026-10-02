@@ -3,6 +3,7 @@ import { X, Mail, Lock, ShieldCheck, Sparkles, Check, Camera, LogIn, UserPlus } 
 import confetti from 'canvas-confetti';
 import { authStore } from '../utils/authStore';
 import { countriesList } from '../data/mockCommunityData';
+import GoogleSignInButton from './GoogleSignInButton';
 
 
 export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
@@ -206,6 +207,26 @@ export default function AccountAuthModal({ isOpen, onClose, onLoginSuccess }) {
             <span>{successMessage}</span>
           </div>
         )}
+
+        {/* Google: the only "with your Gmail account" flow this app can offer.
+            It is an ID token from Google, verified by our server — never a password. */}
+        <div className="space-y-2.5">
+          <GoogleSignInButton
+            onSignedIn={(result) => {
+              setSuccessMessage(`Signed in as ${result.account.name}.`);
+              setTimeout(() => {
+                onLoginSuccess(result.account);
+                onClose();
+              }, 700);
+            }}
+            onError={() => setLoading(false)}
+          />
+          <div className="flex items-center gap-3" aria-hidden="true">
+            <span className="h-px flex-1 bg-white/10" />
+            <span className="text-[10px] uppercase tracking-[0.18em] text-rose-100/40">or use your email</span>
+            <span className="h-px flex-1 bg-white/10" />
+          </div>
+        </div>
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="space-y-3.5">

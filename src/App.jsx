@@ -26,6 +26,7 @@ import SafetyCentre from './components/SafetyCentre';
 import OnboardingWizard from './components/OnboardingWizard';
 import ChatThread from './components/ChatThread';
 import PremiumSheet from './components/PremiumSheet';
+import AdManagerSheet from './components/AdManagerSheet';
 import AgeGate from './components/AgeGate';
 import { hasVerifiedAge } from './utils/ageVerification';
 import { datingStore } from './utils/datingStore';
@@ -41,14 +42,31 @@ import { realtimeHub } from './utils/realtimeHub';
 import { authStore } from './utils/authStore';
 import { Heart, Radio } from 'lucide-react';
 
+/**
+ * Which tab to open on. Installed PWAs and home-screen shortcuts arrive as
+ * `/?tab=reels`, so the URL decides the tab on first paint and every tab change
+ * writes back to the URL — a chat screenshot or a "look at this deck" link can then
+ * be a real link, and the phone back button behaves.
+ */
+const TAB_IDS = ['discover', 'inbox', 'likes', 'reels', 'stories', 'chat', 'leaderboard', 'feedback', 'discussions', 'photos', 'safety'];
+
+function tabFromUrl() {
+  // `location` is absent under SSR (the smoke harness renders App on the server),
+  // so read it defensively and fall back rather than crash the whole tree.
+  const search = typeof window === 'undefined' ? '' : window.location?.search || '';
+  const wanted = new URLSearchParams(search).get('tab');
+  return TAB_IDS.includes(wanted) ? wanted : 'discover';
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('discover'); // discover | inbox | likes | reels | stories | chat | leaderboard | feedback | discussions | photos | safety
+  const [activeTab, setActiveTab] = useState(tabFromUrl); // discover | inbox | likes | reels | stories | chat | leaderboard | feedback | discussions | photos | safety
   const [datingSubTab, setDatingSubTab] = useState('swipe'); // 'swipe' (deck) | 'radar' (grid)
 
   const { state: dating, store: datingApi } = useDating();
   const [ageVerifiedAt, setAgeVerifiedAt] = useState(() => (hasVerifiedAge() ? Date.now() : null));
   const [showOnboarding, setShowOnboarding] = useState(() => !datingStore.isOnboarded());
   const [isPremiumOpen, setIsPremiumOpen] = useState(false);
+  const [isAdManagerOpen, setIsAdManagerOpen] = useState(false);
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [safetyTarget, setSafetyTarget] = useState(null);
   const [chatWith, setChatWith] = useState(null);
@@ -150,6 +168,16 @@ export default function App() {
 
   // Boot handshake with the backend: restore a real session, hydrate matching and
   // chat from the database, and record whether this host has an API at all.
+  useEffect(() => {
+    const loc = typeof window === 'undefined' ? null : window.location;
+    if (!loc || !window.history?.replaceState) return undefined;
+    const params = new URLSearchParams(loc.search);
+    if (params.get('tab') === activeTab) return undefined;
+    params.set('tab', activeTab);
+    window.history.replaceState({}, '', `${loc.pathname}?${params}`);
+    return undefined;
+  }, [activeTab]);
+
   useEffect(() => {
     let alive = true;
     authStore
@@ -501,6 +529,7 @@ export default function App() {
         onClose={() => setIsVideoCallOpen(false)}
         partnerUser={videoCallPartner}
         userProfile={identity}
+        onOpenPremium={() => setIsPremiumOpen(true)}
       />
 
       {/* Author / User Public Profile & Bio Modal with Real-Time Stories, Reels & Social Links */}
@@ -539,7 +568,7 @@ export default function App() {
 
       {/* Top Luxury Sponsor Ad Banner (Hidden during Fullscreen Reels) */}
       {activeTab !== 'reels' && (
-        <AdBanner type="banner" adIndex={0} />
+        <AdBanner type="banner" adIndex={0} onAction={(kind) => (kind === 'ads' ? setIsAdManagerOpen(true) : setIsPremiumOpen(true))} />
       )}
 
       {/* Main Content Area */}
@@ -660,7 +689,7 @@ export default function App() {
 
             {/* In-Feed Native Sponsored Ad */}
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-              <AdBanner type="native" adIndex={1} />
+              <AdBanner type="native" adIndex={1} onAction={(kind) => (kind === 'ads' ? setIsAdManagerOpen(true) : setIsPremiumOpen(true))} />
             </div>
 
             {/* Remaining Stories */}
@@ -834,11 +863,13 @@ export default function App() {
         />
       )}
 
+      <AdManagerSheet open={isAdManagerOpen} onClose={() => setIsAdManagerOpen(false)} />
+
       <PremiumSheet
         open={isPremiumOpen}
         onClose={() => setIsPremiumOpen(false)}
         isPremium={datingApi.isPremium()}
-        onActivate={(plan) => { datingApi.setPremium(plan); }}
+        onActivate={(plan) => datingApi.setPremium(plan)}
       />
 
       <SafetyCentre

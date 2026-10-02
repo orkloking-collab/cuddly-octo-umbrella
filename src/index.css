@@ -11,6 +11,42 @@
     overscroll-behavior-y: none;
   }
 
+  /* Mobile polish: no auto text-inflation when the browser rotates, no 300 ms
+     double-tap zoom delay on controls, no blue tap flash on Android. */
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  button,
+  a,
+  input,
+  select,
+  textarea,
+  [role='button'] {
+    touch-action: manipulation;
+  }
+
+  /* Notched phones: the tab bar and chat composer must clear the home indicator,
+     and full-height sheets must follow the URL bar rather than the old vh unit. */
+  .h-screen-safe {
+    height: 100vh;
+    height: 100dvh;
+  }
+
+  .min-h-screen-safe {
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+
+  .pb-safe {
+    padding-bottom: calc(0.375rem + env(safe-area-inset-bottom));
+  }
+
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+
   /* Serif display face used for story titles and headings. */
   .font-serif-bn,
   .font-display {

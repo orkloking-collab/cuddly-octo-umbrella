@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "Romancha — Verified Dating",
+  "short_name": "Romancha",
+  "description": "18+ dating app: photo-verified profiles, a swipe deck ranked on shared interests, expiring matches, real video dates.",
+  "lang": "en",
+  "dir": "ltr",
+  "scope": "/",
+  "start_url": "/?source=pwa",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#0d0714",
+  "theme_color": "#0d0714",
+  "categories": ["social", "lifestyle", "photo"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-192-maskable.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Swipe deck", "short_name": "Deck", "url": "/?tab=discover", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Matches and messages", "short_name": "Inbox", "url": "/?tab=inbox", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Reels", "short_name": "Reels", "url": "/?tab=reels", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

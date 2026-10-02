@@ -1,12 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft, MoreVertical, Video, ShieldAlert, HeartCrack, Camera, Mic, Send,
-  Sparkles, Clock, PhoneCall, LifeBuoy,
+  Sparkles, Clock, PhoneCall, LifeBuoy, ImagePlus, X, Square,
 } from 'lucide-react';
 import SmartImage from './SmartImage';
 import { useDating, useDialog, useNow, timeAgo, formatCountdown } from '../utils/useDating';
 import { replyTo, matchOpener, suggestedReplies, staleness } from '../utils/chatEngine';
-import { portraitTile } from '../utils/photoFallback';
+import { preparePhoto, sendRecording, startVoiceRecorder, captureSelfie } from '../utils/mediaApi';
+
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 
 const REAL_CHAT_NOTICES = {
   harassment: 'That message crossed a line. A real member can report it and lose your account over it — report yourself to Trust & Safety instead, and mean it.',
@@ -28,12 +33,133 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
   const [menuOpen, setMenuOpen] = useState(false);
   const [safeTimer, setSafeTimer] = useState(null);
   const listRef = useRef(null);
+  // ---- real media capture (no placeholders anywhere in this flow) ----
+  const fileRef = useRef(null);
+  const recorderRef = useRef(null);
+  const [busy, setBusy] = useState(''); // '' | 'photo' | 'camera' | 'voice'
+  const [pendingPhoto, setPendingPhoto] = useState('');
+  const [notice, setNotice] = useState('');
+  const [recSeconds, setRecSeconds] = useState(0);
+  const [level, setLevel] = useState(0);
+  const [zoom, setZoom] = useState('');
+
+  useEffect(() => {
+    if (busy !== 'voice') return undefined;
+    const t = setInterval(() => setRecSeconds((v) => v + 1), 1000);
+    return () => clearInterval(t);
+  }, [busy]);
+
+  // Any capture in flight must not survive a closed thread, or the microphone
+  // stays hot after the sheet is gone.
+  useEffect(() => () => {
+    if (recorderRef.current) { recorderRef.current.cancel(); recorderRef.current = null; }
+  }, []);
+
+  function flash(message) {
+    setNotice(message);
+    setTimeout(() => setNotice(''), 6000);
+  }
+
+  async function onPickPhoto(event) {
+    const file = event.target.files?.[0];
+    event.target.value = ''; // let the same file be picked twice
+    if (!file) return;
+    setBusy('photo');
+    try {
+      const out = await preparePhoto(file, { onProgress: () => {} });
+      setPendingPhoto(out.url);
+      setUploadResult(out);
+      setBusy('');
+    } catch (err) {
+      setBusy('');
+      setPendingPhoto('');
+      flash(err?.message || 'That photo could not be prepared.');
+    }
+  }
+
+  async function shoot() {
+    setBusy('camera');
+    try {
+      const out = await captureSelfie();
+      setPendingPhoto(out.dataUrl);
+      setUploadResult(null);
+      setBusy('');
+    } catch (err) {
+      setBusy('');
+      flash(err?.message || 'Camera could not start. Check the permission in your browser address bar.');
+    }
+  }
+
+  function closeCamera() {
+    if (busy === 'camera') setBusy('');
+  }
+
+  async function sendPendingPhoto() {
+    const url = pendingPhoto;
+    if (!url) return;
+    const localOnly = !uploadResult || uploadResult.local;
+    const bytes = uploadResult?.bytes ?? Math.round(url.length * 0.75);
+    setBusy('photo');
+    const text = draft.trim();
+    setDraft('');
+    store.sendMedia(matchId, {
+      kind: 'photo', url, bytes, text, localOnly,
+      note: localOnly ? 'Photo kept in this tab only — start the Romancha server to store it on your account.' : '',
+    });
+    setPendingPhoto('');
+    setUploadResult(null);
+    setBusy('');
+  }
+
+  async function startRecording() {
+    setBusy('voice');
+    setRecSeconds(0);
+    setLevel(0);
+    try {
+      const rec = await startVoiceRecorder({ onLevel: setLevel });
+      recorderRef.current = rec;
+      rec.done().then(async ({ blob, ms }) => {
+        recorderRef.current = null;
+        setBusy('');
+        setLevel(0);
+        try {
+          const out = await sendRecording(blob);
+          store.sendMedia(matchId, {
+            kind: 'voice', url: out.url, bytes: out.bytes, durationMs: ms, localOnly: Boolean(out.local),
+            note: out.note || '',
+          });
+        } catch (err) {
+          flash(err?.message || 'The recording could not be sent.');
+        }
+      }).catch((err) => {
+        recorderRef.current = null;
+        setBusy('');
+        flash(err?.message || 'Recording failed.');
+      });
+    } catch (err) {
+      setBusy('');
+      flash(err?.message || 'Microphone unavailable.');
+    }
+  }
+
+  function stopRecording() {
+    recorderRef.current?.stop();
+  }
+
+  function cancelRecording() {
+    recorderRef.current?.cancel();
+    recorderRef.current = null;
+    setBusy('');
+    setLevel(0);
+  }
   // Real accounts live in `state.people` (hydrated from the server); personas in
   // the bundled dataset. personById knows both, so one thread component serves
   // scripted matches and genuine ones.
   const them = useMemo(() => store.personById(matchId), [matchId, store, state.people]);
   const isRealChat = store.isRemoteId(matchId) && state.server?.mode === 'server';
   const [thread, setThread] = useState(() => store.thread(matchId));
+  // Prepared upload for the photo that is waiting for the Send tap.
+  const [uploadResult, setUploadResult] = useState(null);
 
   useDialog(Boolean(matchId), onClose);
 
@@ -195,6 +321,7 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
             readReceipts={store.getState().prefs.readReceipts}
             now={now}
             onAction={() => { onOpenSafety?.(them); }}
+            onZoom={(src) => setZoom(src)}
           />
         ))}
 
@@ -221,17 +348,77 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
         </div>
       )}
 
+      {/* Live capture feedback: camera preview, recording meter, upload status */}
+      {(pendingPhoto || busy) && (
+        <div className="flex items-center gap-3 border-t border-white/10 bg-[#1b0f28] px-3 py-2">
+          {pendingPhoto && <img src={pendingPhoto} alt="Preview of the photo you are about to send" className="h-14 w-14 rounded-xl object-cover" />}
+          <div className="min-w-0 flex-1 text-[11.5px] text-rose-100/80">
+            {busy === 'photo' && 'Uploading your photo…'}
+            {busy === 'camera' && 'Camera open — hold still'}
+            {busy === 'voice' && (
+              <span className="flex items-center gap-2">
+                Recording {formatClock(recSeconds)}
+                <span className="flex items-end gap-0.5" aria-hidden="true">
+                  {Array.from({ length: 9 }, (_, i) => (
+                    <span key={i} className="w-1 rounded-full bg-rose-300" style={{ height: `${4 + Math.round(Math.max(0, level) * 22 * (i % 3 ? 1 : 0.7))}px` }} />
+                  ))}
+                </span>
+                <span className="text-rose-100/45">tap the stop square to send, or cancel</span>
+              </span>
+            )}
+            {pendingPhoto && busy !== 'photo' && !notice && (
+              <span className="flex flex-wrap items-center gap-2">
+                That photo is ready to send.
+                <button onClick={sendPendingPhoto} className="rounded-full bg-rose-600 px-3 py-1 text-[11px] font-semibold text-white">Send</button>
+                <button onClick={() => { setPendingPhoto(''); closeCamera(); }} className="rounded-full border border-white/15 px-3 py-1 text-[11px]">Retake</button>
+              </span>
+            )}
+            {notice && <span className="block text-amber-200">{notice}</span>}
+          </div>
+          {busy === 'voice' && (
+            <button onClick={cancelRecording} className="rounded-full border border-white/15 px-2.5 py-1 text-[11px] text-rose-100">Cancel</button>
+          )}
+          {pendingPhoto && (
+            <button onClick={() => { setPendingPhoto(''); closeCamera(); }} aria-label="Discard this photo" className="rounded-full p-1.5 text-rose-100/70 hover:bg-white/10"><X className="h-4 w-4" /></button>
+          )}
+        </div>
+      )}
+
+      {zoom && (
+        <div className="fixed inset-0 z-[99] flex items-center justify-center bg-black/85 p-4" role="dialog" aria-modal="true" aria-label="Photo full size" onClick={() => setZoom('')}>
+          <button onClick={() => setZoom('')} aria-label="Close photo" className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white"><X className="h-5 w-5" /></button>
+          <img src={zoom} alt="Shared photo, full size" className="max-h-full max-w-full rounded-2xl object-contain" />
+        </div>
+      )}
+
       {/* Composer */}
       <form
         onSubmit={(e) => { e.preventDefault(); send(); }}
-        className="flex items-end gap-2 border-t border-white/10 bg-[#150b1f] px-3 py-2.5"
+        className="flex items-end gap-2 border-t border-white/10 bg-[#150b1f] px-3 py-2.5 pb-safe"
       >
-        <button type="button" aria-label="Attach a photo" onClick={() => store.appendMessage(matchId, { from: 'me', kind: 'photo', text: 'Photo (demo) — real uploads are disabled in this build', media: portraitTile({ name: profile.name, seed: 'me-photo' }) })} className="rounded-full p-2 text-rose-100/70 hover:bg-white/10">
-          <Camera className="h-5 w-5" />
-        </button>
-        <button type="button" aria-label="Send a voice note" onClick={() => store.appendMessage(matchId, { from: 'me', kind: 'voice', text: 'Voice note · 0:07', duration: 7 })} className="rounded-full p-2 text-rose-100/70 hover:bg-white/10">
-          <Mic className="h-5 w-5" />
-        </button>
+        <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onPickPhoto} />
+        <button
+          type="button"
+          aria-label="Attach a photo from your device"
+          title="Attach a photo from your device"
+          onClick={() => fileRef.current?.click()}
+          disabled={Boolean(busy)}
+          className="rounded-full p-2 text-rose-100/70 hover:bg-white/10 disabled:opacity-40"
+        ><ImagePlus className="h-5 w-5" /></button>
+        <button
+          type="button"
+          aria-label={busy === 'camera' ? 'Close the camera' : 'Take a photo with the camera'}
+          title="Take a photo right now"
+          onClick={() => (busy === 'camera' ? closeCamera() : shoot())}
+          className={`rounded-full p-2 hover:bg-white/10 ${busy === 'camera' ? 'bg-rose-500/25 text-rose-200' : 'text-rose-100/70'}`}
+        >{busy === 'camera' ? <X className="h-5 w-5" /> : <Camera className="h-5 w-5" />}</button>
+        <button
+          type="button"
+          aria-label={busy === 'voice' ? 'Stop recording and send' : 'Record a voice note'}
+          title={busy === 'voice' ? 'Stop and send' : 'Record a voice note (up to 2 minutes)'}
+          onClick={() => (busy === 'voice' ? stopRecording() : startRecording())}
+          className={`rounded-full p-2 hover:bg-white/10 ${busy === 'voice' ? 'bg-rose-600/40 text-white' : 'text-rose-100/70'}`}
+        >{busy === 'voice' ? <Square className="h-5 w-5 animate-pulse" /> : <Mic className="h-5 w-5" />}</button>
         <textarea
           value={draft}
           onChange={(e) => setDraft(e.target.value.slice(0, 1200))}
@@ -268,16 +455,22 @@ function Message({ msg, them, onAction, readReceipts, now }) {
             : mine ? 'rounded-br-md bg-gradient-to-br from-rose-600 to-pink-600 text-white'
               : 'rounded-bl-md bg-white/[0.08] text-rose-50'
         }`}>
-          {msg.kind === 'photo' && <img src={msg.media} alt="Shared photo" className="mb-2 w-full rounded-xl" />}
-          {msg.kind === 'voice' && (
-            <span className="mb-1.5 flex items-center gap-1">
-              <span className="grid h-7 w-7 place-items-center rounded-full bg-white/20"><Mic className="h-3.5 w-3.5" /></span>
-              <span className="flex flex-1 items-end gap-0.5 px-1">
-                {Array.from({ length: 22 }, (_, i) => <span key={i} className="w-0.5 rounded-full bg-current opacity-70" style={{ height: `${6 + ((i * 37) % 16)}px` }} />)}
+          {msg.kind === 'photo' && (msg.media
+            ? (
+              <button onClick={() => onZoom?.(msg.media)} className="mb-1.5 block w-full overflow-hidden rounded-xl" aria-label="Open photo full size">
+                <img src={msg.media} alt={msg.text || 'Photo you sent'} className="w-full object-cover" loading="lazy" />
+              </button>
+            )
+            : <p className="mb-1 text-[11.5px] italic opacity-70">Photo message with no file attached.</p>)}
+          {msg.kind === 'voice' && (msg.media
+            ? (
+              <span className="mb-1.5 flex w-full min-w-[210px] flex-col gap-1">
+                <audio controls preload="metadata" src={msg.media} className="h-9 w-full" aria-label="Voice note" />
+                <span className="text-[10.5px] opacity-70">{formatClock(Math.round((msg.durationMs || 0) / 1000))} voice note</span>
               </span>
-              <span className="text-[11px] opacity-80">{msg.duration}s</span>
-            </span>
-          )}
+            )
+            : <p className="mb-1 text-[11.5px] italic opacity-70">This voice note was never recorded — demo placeholder.</p>)}
+          {msg.note && <p className="mt-1 text-[10.5px] italic opacity-70">{msg.note}</p>}
           <span className="whitespace-pre-wrap">{msg.text}</span>
         </div>
         {isGuard && msg.action && (

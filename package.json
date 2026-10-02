@@ -12,7 +12,8 @@
     "lint:fix": "oxlint src server tests scripts --fix",
     "test": "node --test tests/matching.test.mjs tests/datingStore.test.mjs tests/webrtcCall.test.mjs tests/server.test.mjs",
     "smoke": "node scripts/ssr-smoke.mjs",
-    "db:reset": "node -e \"const f=process.env.ROMANCHA_DB||'data/romancha.db';require('node:fs').rmSync(f,{force:true});console.log('reset',f)\""
+    "db:reset": "node -e \"const f=process.env.ROMANCHA_DB||'data/romancha.db';require('node:fs').rmSync(f,{force:true});console.log('reset',f)\"",
+    "icons": "node scripts/gen-icons.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

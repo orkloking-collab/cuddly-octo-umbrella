@@ -1,10 +1,13 @@
 import React from 'react';
-import { Heart, MessageSquare, Sparkles, ShieldCheck, User } from 'lucide-react';
+import { Heart, MessageSquare, Sparkles, ShieldCheck, User, Video } from 'lucide-react';
 import { useDating } from '../utils/useDating';
 
 /**
- * Mobile tab bar. Rewritten for the dating flow: Deck / Likes / Inbox / Profile,
- * with real badge counts instead of a decorative ping dot.
+ * Mobile tab bar: Likes / Reels / [deck] / Inbox / Safety / You.
+ *
+ * The centre button is the deck, so the deck does not need a second entry — that
+ * slot went to Reels, which previously only existed in the desktop navbar and was
+ * therefore invisible on a phone. Badge counts are real, not decorative.
  */
 export default function MobileBottomNav({ activeTab, setActiveTab, onOpenProfileModal, onOpenLikes }) {
   const { store } = useDating();
@@ -13,14 +16,14 @@ export default function MobileBottomNav({ activeTab, setActiveTab, onOpenProfile
   const likes = store.pendingLikes().length;
 
   const items = [
-    { id: 'discover', label: 'Deck', icon: Heart, active: 'text-pink-400' },
     { id: 'likes', label: 'Likes', icon: Sparkles, count: likes },
+    { id: 'reels', label: 'Reels', icon: Video },
     { id: 'inbox', label: 'Inbox', icon: MessageSquare, count: unread + newMatches },
     { id: 'safety', label: 'Safety', icon: ShieldCheck },
   ];
 
   return (
-    <div className="xl:hidden fixed bottom-0 inset-x-0 z-40 bg-[#120819]/95 backdrop-blur-lg border-t border-rose-900/40 px-2 py-1.5 shadow-2xl">
+    <div className="xl:hidden fixed bottom-0 inset-x-0 z-40 bg-[#120819]/95 backdrop-blur-lg border-t border-rose-900/40 px-2 pb-safe pt-1.5 shadow-2xl">
       <div className="flex items-center justify-around max-w-md mx-auto">
         {items.slice(0, 2).map((it) => (
           <TabButton key={it.id} item={it} activeTab={activeTab} setActiveTab={setActiveTab} onOpenLikes={onOpenLikes} />
@@ -30,7 +33,8 @@ export default function MobileBottomNav({ activeTab, setActiveTab, onOpenProfile
         <button
           onClick={() => setActiveTab('discover')}
           aria-label="Open your deck"
-          className="relative -top-2.5 w-12 h-12 rounded-full bg-gradient-to-tr from-rose-600 via-pink-600 to-amber-500 p-0.5 shadow-xl shadow-rose-600/50 flex items-center justify-center text-white active:scale-95 transition-transform"
+          aria-current={activeTab === 'discover' ? 'page' : undefined}
+          className={`relative -top-2.5 w-12 h-12 rounded-full bg-gradient-to-tr from-rose-600 via-pink-600 to-amber-500 p-0.5 shadow-xl shadow-rose-600/50 flex items-center justify-center text-white active:scale-95 transition-transform ${activeTab === 'discover' ? 'ring-2 ring-rose-300 ring-offset-2 ring-offset-[#120819]' : ''}`}
         >
           <span className="w-full h-full bg-[#180924] rounded-full flex flex-col items-center justify-center">
             <Heart className="w-5 h-5 text-rose-400 fill-rose-500/40" />

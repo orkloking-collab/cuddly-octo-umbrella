@@ -1,12 +1,13 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ShieldCheck, Camera, Ban, FileWarning, Download, Trash2, PhoneCall, LifeBuoy,
-  ChevronRight, Check, Clock, Lock,
+  ChevronRight, Check, Clock, Lock, Mic, Image as ImageIcon,
 } from 'lucide-react';
 import SmartImage from './SmartImage';
 import { useDating, useNow, timeAgo } from '../utils/useDating';
 import PhoneVerifyPanel from './PhoneVerifyPanel';
 import { datingProfiles } from '../data/datingProfiles';
+import { serverSync } from '../utils/serverSync';
 
 const TABS = [
   { id: 'verify', label: 'Verification', icon: Camera },
@@ -259,11 +260,62 @@ export default function SafetyCentre({ open, onClose, targetProfile = null }) {
           )}
 
           {tab === 'data' && (
+            <DataPanel store={store} state={state} exportData={exportData} say={say} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Your data, in the two modes this app can run in.
+ *
+ * The list of uploads matters on a dating app more than most places: a photo you
+ * sent once should be removable, and "delete everything" has to mean the server too,
+ * not just the browser. Deleting a file drops it from your account; the bytes are
+ * only unlinked when nobody else's message points at the same content hash.
+ */
+function DataPanel({ store, state, exportData, say }) {
+  const online = state.server?.mode === 'server';
+  const [media, setMedia] = useState(null);
+  const [busy, setBusy] = useState('');
+
+  const refresh = () => serverSync.uploads().then((out) => setMedia(out?.files ? out : { error: out?.error || 'unavailable' }));
+
+  useEffect(() => {
+    if (!online) { setMedia(null); return undefined; }
+    let alive = true;
+    serverSync.uploads().then((out) => { if (alive) setMedia(out?.files ? out : { error: out?.error || 'unavailable' }); });
+    return () => { alive = false; };
+  }, [online]);
+
+  async function remove(id) {
+    setBusy(id);
+    await serverSync.deleteUpload(id);
+    await refresh();
+    setBusy('');
+    say('That file is off your account.');
+  }
+
+  async function wipeServer() {
+    setBusy('all');
+    await serverSync.deleteAllUploads();
+    await refresh();
+    setBusy('');
+    say('Media deleted from the server too.');
+  }
+
+  return (
             <section className="space-y-2.5">
               <p className="text-[12.5px] leading-relaxed text-rose-100/70">
-                Romancha (this build) stores your profile, swipes, matches and messages in this browser only —
-                <span className="text-white"> no server, no analytics, no ad trackers</span>. That is also why your
-                data is trivially portable:
+                {online ? (
+                  <>You are signed in, so your profile, swipes, matches and messages live in the Romancha database —
+                    <span className="text-white"> not in analytics, not in an ad network</span>. Export and delete below work on the server copy.</>
+                ) : (
+                  <>This build has no server connected, so your profile, swipes, matches and messages live in this browser only —
+                    <span className="text-white"> no analytics, no ad trackers, nothing to request from a company</span>.</>
+                )}
               </p>
               <button onClick={exportData} className="flex w-full items-center gap-2 rounded-2xl border border-white/12 bg-white/[0.03] px-3.5 py-3 text-[13px] font-semibold text-white hover:bg-white/[0.06]">
                 <Download className="h-4 w-4 text-rose-300" /> Export everything as JSON
@@ -274,11 +326,58 @@ export default function SafetyCentre({ open, onClose, targetProfile = null }) {
               >
                 <Trash2 className="h-4 w-4" /> Delete all my dating data
               </button>
-              <p className="text-[11px] text-rose-100/45">Keys used: romancha_dating_v1, romancha_age_gate_v1, romancha_accounts_database_v2.</p>
+              {online && (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[12px] font-semibold text-white">Photos and voice notes you uploaded</p>
+                    <button onClick={refresh} className="rounded-full border border-white/12 px-2 py-0.5 text-[10.5px] text-rose-100/70">Refresh</button>
+                  </div>
+                  {!media ? (
+                    <p className="mt-1.5 text-[11.5px] text-rose-100/45">Checking…</p>
+                  ) : media.error ? (
+                    <p className="mt-1.5 text-[11.5px] text-amber-200">{media.error}</p>
+                  ) : media.files.length === 0 ? (
+                    <p className="mt-1.5 text-[11.5px] text-rose-100/45">Nothing stored. Chat photos and voice notes appear here.</p>
+                  ) : (
+                    <>
+                      <p className="mt-1 text-[11px] text-rose-100/50">{(media.usedBytes / 1024).toFixed(0)} KB of {(media.quotaBytes / 1024 / 1024).toFixed(0)} MB used</p>
+                      <ul className="mt-2 space-y-1.5">
+                        {media.files.map((f) => (
+                          <li key={f.id} className="flex items-center gap-2">
+                            {f.kind === 'image' && f.url ? (
+                              <img src={f.url} alt="" className="h-8 w-8 shrink-0 rounded-lg object-cover" loading="lazy" />
+                            ) : (
+                              <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ${f.kind === 'voice' ? 'bg-sky-500/15 text-sky-300' : 'bg-white/8 text-rose-200'}`}>
+                                {f.kind === 'voice' ? <Mic className="h-3.5 w-3.5" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                              </span>
+                            )}
+                            <span className="min-w-0 flex-1 truncate text-[11.5px] text-rose-100/70">
+                              {f.kind} · {(f.bytes / 1024).toFixed(0)} KB · {new Date(f.at).toLocaleDateString()}
+                            </span>
+                            <button onClick={() => remove(f.id)} disabled={busy === f.id} className="shrink-0 rounded-full border border-rose-400/40 px-2 py-0.5 text-[10.5px] text-rose-200 disabled:opacity-50">
+                              Delete
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                  {media?.files?.length > 0 && (
+                    <button
+                      onClick={() => { if (window.confirm('Delete every photo and voice note from your account? Chats will keep the text but the media will be gone.')) wipeServer(); }}
+                      disabled={busy === 'all'}
+                      className="mt-2.5 w-full rounded-xl border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-[12px] font-semibold text-rose-200 disabled:opacity-50"
+                    >
+                      {busy === 'all' ? 'Deleting…' : 'Delete all media on the server'}
+                    </button>
+                  )}
+                </div>
+              )}
+              <p className="text-[11px] text-rose-100/45">
+                {online
+                  ? 'This browser also keeps a working copy in localStorage (romancha_dating_v1) so the app opens instantly. Clearing it does not delete the server copy — use the buttons above.'
+                  : 'Keys used: romancha_dating_v1, romancha_age_gate_v1, romancha_accounts_database_v2.'}
+              </p>
             </section>
-          )}
-        </div>
-      </div>
-    </div>
   );
 }
