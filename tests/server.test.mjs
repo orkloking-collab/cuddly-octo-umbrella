@@ -16,6 +16,11 @@ process.env.ALLOW_INLINE_CODE = '1';
 // Each client gets its own "IP" so the anonymous rate limiter cannot make one test
 // fail because an earlier test in the same file registered accounts.
 process.env.TRUST_PROXY = '1';
+// Uploads go to a throwaway directory so the suite never writes into data/.
+const os = await import('node:os');
+const fsp = await import('node:fs/promises');
+const uploadDir = await fsp.mkdtemp(`${os.tmpdir()}/romancha-uploads-`);
+process.env.ROMANCHA_UPLOADS = uploadDir;
 
 const { createBackend } = await import('../server/backend.mjs');
 
@@ -38,6 +43,7 @@ test.after(async () => {
   server?.close();
   await once(server, 'close');
   backend?.close();
+  await fsp.rm(uploadDir, { recursive: true, force: true });
   Object.assign(process.env, ORIG);
 });
 
@@ -256,10 +262,14 @@ test('free daily like quota is enforced by the server', async () => {
   assert.equal(state.body.quota.used, 25, 'exactly the free-tier allowance is spent');
   assert.ok(rejected > 0, 'over-quota likes are rejected with 429');
 
-  // Premium raises the ceiling.
+  // Premium raises the ceiling — and only for plan ids the catalogue knows, so a
+  // crafted request cannot invent a tier with bigger rights.
   assert.equal((await a.call('GET', '/api/deck')).body.quota.remaining, 0);
-  const buy = await a.call('POST', '/api/premium', { plan: 'gold' });
+  const fake = await a.call('POST', '/api/premium', { plan: 'everything-free' });
+  assert.equal(fake.status, 400, 'unknown plans are rejected');
+  const buy = await a.call('POST', '/api/premium', { plan: 'month' });
   assert.equal(buy.status, 200);
+  assert.ok(buy.body.limitSeconds > 2 * 3600, 'the month plan also raises the daily call allowance');
   const remaining = (await a.call('GET', '/api/deck?all=1')).body.deck[26];
   const extra = await a.call('POST', '/api/swipe', { targetId: remaining.id, kind: 'like' });
   assert.equal(extra.status, 200, 'premium members are not capped');
@@ -472,4 +482,243 @@ test('logout clears the session cookie', async () => {
   const me = await c.call('GET', '/api/auth/me');
   assert.equal(me.body.user, null);
   assert.equal((await c.call('GET', '/api/deck')).status, 401);
+});
+
+/* ------------------------------------------------- phase 3: media, minutes, ads */
+
+const PNG = 'data:image/png;base64,' + Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6]).toString('base64');
+const WEBM = 'data:audio/webm;base64,' + Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 9, 8, 7, 6, 5, 4]).toString('base64');
+
+test('photo and voice uploads are validated, stored and served back', async () => {
+  const a = new Client();
+  await a.register(unique('up'), PASSWORD, 'Uploader');
+
+  const photo = await a.call('POST', '/api/uploads', { dataUrl: PNG, kind: 'image' });
+  assert.equal(photo.status, 201, JSON.stringify(photo.body));
+  assert.match(photo.body.url, /^\/uploads\/[a-f0-9]{40}\.png$/, 'content-addressed filename');
+  assert.equal(photo.body.bytes, 14);
+
+  const voice = await a.call('POST', '/api/uploads', { dataUrl: WEBM, kind: 'voice' });
+  assert.equal(voice.status, 201);
+  assert.match(voice.body.url, /\.webm$/);
+
+  const raw = await fetch(base + photo.body.url);
+  assert.equal(raw.status, 200);
+  assert.equal(raw.headers.get('content-type'), 'image/png');
+  assert.match(raw.headers.get('cache-control') || '', /immutable/);
+  assert.equal(raw.headers.get('x-content-type-options'), 'nosniff');
+
+  // Re-uploading identical bytes is free: same name, one file on disk.
+  const again = await a.call('POST', '/api/uploads', { dataUrl: PNG, kind: 'image' });
+  assert.equal(again.body.url, photo.body.url, 'identical content is deduplicated');
+
+  // Anything that is not a photo or a voice note is refused before it touches disk.
+  assert.equal((await a.call('POST', '/api/uploads', { dataUrl: 'data:text/html;base64,PGgxPng8Lzox', kind: 'image' })).status, 415);
+  assert.equal((await a.call('POST', '/api/uploads', { dataUrl: PNG, kind: 'weapon' })).status, 400);
+  assert.equal((await a.call('POST', '/api/uploads', { dataUrl: 'not-a-data-url', kind: 'image' })).status, 400);
+
+  const listing = await a.call('GET', '/api/uploads');
+  assert.equal(listing.body.files.length, 3, 'the account can list and therefore delete its own media');
+  assert.ok(listing.body.usedBytes > 0);
+
+  // Deleting your own photo removes it from the account listing. The bytes on disk
+  // are only unlinked when nobody else references that hash.
+  const own = listing.body.files.find((f) => f.mime === 'audio/webm');
+  const del = await a.call('DELETE', `/api/uploads/${own.id}`);
+  assert.equal(del.status, 200);
+  assert.equal((await a.call('GET', '/api/uploads')).body.files.length, 2);
+  const thief = new Client();
+  await thief.register(unique('thief'), PASSWORD, 'Thief');
+  assert.equal((await thief.call('DELETE', `/api/uploads/${own.id}`)).status, 404, 'you can only delete files you own');
+  assert.equal((await new Client().call('DELETE', `/api/uploads/${own.id}`)).status, 401, 'and only when signed in');
+
+  // Anonymous: no file listing, and no path traversal out of the uploads dir.
+  const anon = await fetch(`${base}/api/uploads`);
+  assert.equal(anon.status, 401);
+  const traversal = await fetch(`${base}/uploads/..%2F..%2Fpackage.json`);
+  assert.equal(traversal.status, 404);
+});
+
+test('a photo message carries the real file into the thread, both directions', async () => {
+  const a = new Client();
+  const b = new Client();
+  await a.register(unique('ma'), PASSWORD, 'SenderA');
+  await b.register(unique('mb'), PASSWORD, 'SenderB');
+  await a.call('PUT', '/api/profile', { profile: { name: 'SenderA', age: 30, gender: 'Man', seeking: ['Everyone'] }, prefs: { seek: 'Everyone' } });
+  await b.call('PUT', '/api/profile', { profile: { name: 'SenderB', age: 29, gender: 'Woman', seeking: ['Everyone'] }, prefs: { seek: 'Everyone' } });
+  const idA = (await a.call('GET', '/api/auth/me')).body.user.id;
+  const idB = (await b.call('GET', '/api/auth/me')).body.user.id;
+  await a.call('POST', '/api/swipe', { targetId: `usr:${idB}`, kind: 'like' });
+  await b.call('POST', '/api/swipe', { targetId: `usr:${idA}`, kind: 'like' });
+  const matches = (await b.call('GET', '/api/state')).body.matches;
+  const matchId = matches[0].id;
+
+  const up = await b.call('POST', '/api/uploads', { dataUrl: PNG, kind: 'image' });
+  const sent = await b.call('POST', `/api/matches/${matchId}/messages`, { kind: 'photo', mediaUrl: up.body.url, text: 'This is me at Cox’s Bazar' });
+  assert.equal(sent.status, 201, JSON.stringify(sent.body));
+
+  const thread = await a.call('GET', `/api/matches/${matchId}`);
+  const photo = thread.body.messages.find((m) => m.kind === 'photo');
+  assert.ok(photo, 'the photo landed in the other person’s thread');
+  assert.match(photo.media, /^\/uploads\//);
+  assert.equal(photo.text, 'This is me at Cox’s Bazar');
+
+  // A message with neither text nor media is still rejected.
+  assert.equal((await b.call('POST', `/api/matches/${matchId}/messages`, { kind: 'photo' })).status, 400);
+});
+
+test('the price list the UI reads is the price list the API enforces', async () => {
+  const res = await fetch(`${base}/api/plans`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.free.dailyCallSeconds, 20 * 60, 'free tier is 20 minutes of calls per day');
+  const day = body.plans.find((p) => p.id === 'day');
+  assert.equal(day.priceUsd, 1, 'the entry plan is one dollar');
+  assert.equal(day.dailyCallSeconds, 2 * 3600, 'and it buys two hours a day');
+  assert.ok(body.plans.every((p) => p.perks.length > 0), 'every plan lists what you actually get');
+  assert.ok(body.plans.every((p) => p.days >= 1 && p.priceUsd > 0));
+});
+
+test('video minutes are metered by the server, then raised by a $1 plan', async () => {
+  const a = new Client();
+  await a.register(unique('call'), PASSWORD, 'Caller');
+
+  const before = await a.call('GET', '/api/calls/state');
+  assert.equal(before.status, 200);
+  assert.equal(before.body.limitSeconds, 1200, 'free accounts get 20 minutes');
+  assert.equal(before.body.usedSeconds, 0);
+  assert.ok(before.body.resetsAt > Date.now(), 'the reset time is in the future');
+
+  const start = await a.call('POST', '/api/calls/start', { matchId: 'usr:someone' });
+  assert.equal(start.status, 201);
+  assert.ok(start.body.sessionId);
+
+  const beat = await a.call('POST', '/api/calls/heartbeat', { sessionId: start.body.sessionId });
+  assert.equal(beat.status, 200);
+  assert.ok(beat.body.secondsLeft <= 1200);
+
+  // Pretend the call ran 21 minutes: the *server* clock is what counts, so no
+  // client-side arithmetic can stretch the allowance.
+  await backend.db.run('UPDATE call_sessions SET started_at = ? WHERE id = ?', [Date.now() - 21 * 60_000, start.body.sessionId]);
+  const after = await a.call('GET', '/api/calls/state');
+  assert.ok(after.body.usedSeconds >= 1200, `used ${after.body.usedSeconds}s of the free allowance`);
+  assert.equal(after.body.secondsLeft, 0);
+
+  const refused = await a.call('POST', '/api/calls/start', {});
+  assert.equal(refused.status, 429);
+  assert.equal(refused.body.reason, 'call-quota');
+
+  // Text is never metered: only call sessions consume the allowance.
+  const bought = await a.call('POST', '/api/premium', { plan: 'day' });
+  assert.equal(bought.status, 200);
+  const retry = await a.call('POST', '/api/calls/start', {});
+  assert.equal(retry.status, 201, 'the day pass raises the ceiling to 2 hours');
+  assert.ok(retry.body.secondsLeft > 0 && retry.body.secondsLeft <= 7200);
+  const ended = await a.call('POST', '/api/calls/end', { sessionId: retry.body.sessionId });
+  assert.equal(ended.status, 200);
+  const history = await a.call('GET', '/api/calls/history');
+  assert.equal(history.body.calls.length, 2);
+
+  // Someone else’s session cannot be billed or closed.
+  const b = new Client();
+  await b.register(unique('call2'), PASSWORD, 'Other');
+  assert.equal((await b.call('POST', '/api/calls/heartbeat', { sessionId: retry.body.sessionId })).status, 404);
+});
+
+test('ads are first-party: created pending, approved by an admin, counted once per visitor', async () => {
+  const owner = new Client();
+  const visitor = new Client();
+  await owner.register(unique('ad'), PASSWORD, 'Advertiser');
+  await visitor.register(unique('view'), PASSWORD, 'Visitor');
+
+  const bad = await owner.call('POST', '/api/ads', { title: 'Click here', targetUrl: 'javascript:alert(1)' });
+  assert.equal(bad.status, 400, 'script URLs are not an ad destination');
+
+  const created = await owner.call('POST', '/api/ads', { title: 'Velvet Photo Studio', targetUrl: 'https://studio.test/romancha', impressionsBudget: 1000 });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.status, 'pending');
+  assert.ok(created.body.estimatedCostUsd > 0, 'the advertiser sees a price before submitting');
+
+  assert.equal((await owner.call('GET', '/api/ads')).body.ads.length, 0, 'unapproved ads are never shown');
+  assert.ok(/no third-party/i.test((await owner.call('GET', '/api/ads')).body.note));
+
+  process.env.ADMIN_TOKEN = 'test-admin-token';
+  assert.equal((await owner.call('POST', '/api/admin/ads?token=wrong', { id: created.body.id, status: 'active' })).status, 403);
+  assert.equal((await owner.call('POST', '/api/admin/ads?token=test-admin-token', { id: created.body.id, status: 'active' })).status, 200);
+
+  const served = await owner.call('GET', '/api/ads?placement=banner');
+  assert.equal(served.body.ads.length, 1);
+  assert.equal(served.body.ads[0].title, 'Velvet Photo Studio');
+
+  // An advertiser refreshing their own stats must not be able to bill themselves.
+  await owner.call('POST', `/api/ads/${created.body.id}/ping`, { kind: 'impression' });
+  assert.equal((await owner.call('GET', '/api/ads/mine')).body.campaigns[0].impressions, 0);
+  await visitor.call('POST', `/api/ads/${created.body.id}/ping`, { kind: 'impression' });
+  await visitor.call('POST', `/api/ads/${created.body.id}/ping`, { kind: 'click' });
+  const mine = await owner.call('GET', '/api/ads/mine');
+  assert.equal(mine.body.campaigns[0].impressions, 1);
+  assert.equal(mine.body.campaigns[0].clicks, 1);
+  // One impression at $0.40 CPM is a fraction of a cent, and a bill that rounds
+  // each line to whole cents would silently give away the inventory.
+  assert.equal(mine.body.campaigns[0].estimatedCostUsd, 0.0004);
+});
+
+test('Google sign-in is off unless a client id is configured, and never accepts a password', async () => {
+  const config = await fetch(`${base}/api/auth/google/config`).then((r) => r.json());
+  assert.equal(config.enabled, false);
+  assert.equal(config.clientId, null);
+
+  const attempt = await new Client().call('POST', '/api/auth/google', { credential: 'nonsense' });
+  assert.equal(attempt.status, 501, 'with no client id configured the endpoint refuses instead of trusting anything');
+  assert.match(attempt.body.error, /not configured/);
+
+  const withId = new Client();
+  process.env.GOOGLE_CLIENT_ID = 'test-client-id.apps.googleusercontent.com';
+  try {
+    const forged = await withId.call('POST', '/api/auth/google', { credential: 'a.b.c' });
+    // No network access to Google from the suite, and the signature is fake anyway.
+    assert.ok([400, 401, 403, 502].includes(forged.status), `forged token refused with ${forged.status}`);
+    const cfg = await fetch(`${base}/api/auth/google/config`).then((r) => r.json());
+    assert.equal(cfg.enabled, true);
+    assert.equal(cfg.clientId, 'test-client-id.apps.googleusercontent.com');
+  } finally {
+    delete process.env.GOOGLE_CLIENT_ID;
+  }
+
+  // And there is no route anywhere that takes a Gmail password — that path cannot
+  // exist without becoming a credential-harvesting site.
+  const noPasswordRoute = await new Client().call('POST', '/api/auth/gmail', { email: 'a@gmail.com', password: 'hunter2' });
+  assert.equal(noPasswordRoute.status, 401);
+});
+
+test('a one-sided like on a real account never fabricates a match', async () => {
+  const a = new Client();
+  await a.register(unique('one'), PASSWORD, 'OneSided');
+  await a.call('PUT', '/api/profile', { profile: { name: 'OneSided', age: 31, gender: 'Man', seeking: ['Everyone'] }, prefs: { seek: 'Everyone', ageMin: 18, ageMax: 60 } });
+
+  const ids = [];
+  for (let i = 0; i < 4; i += 1) {
+    const other = new Client();
+    await other.register(unique(`back${i}`), PASSWORD, `Backend${i}`);
+    await other.call('PUT', '/api/profile', { profile: { name: `Backend${i}`, age: 28, gender: 'Woman', seeking: ['Everyone'] }, prefs: { seek: 'Everyone', ageMin: 18, ageMax: 60 } });
+    ids.push({ other, id: (await other.call('GET', '/api/auth/me')).body.user.id });
+  }
+
+  for (const [i, { id }] of ids.entries()) {
+    const res = await a.call('POST', '/api/swipe', { targetId: `usr:${id}`, kind: i % 2 ? 'super' : 'like' });
+    assert.equal(res.status, 200);
+    // The persona heuristic must not leak onto real accounts: a like is a like, and
+    // a match needs the other human to press the same button.
+    assert.equal(res.body.matched, false, `one-sided ${i % 2 ? 'super like' : 'like'} reported a match`);
+  }
+
+  assert.equal((await a.call('GET', '/api/state')).body.matches.length, 0, 'no matches without reciprocity');
+  const likedMe = (await ids[0].other.call('GET', '/api/likes')).body.likes;
+  assert.ok(likedMe.some((l) => l.likesMe && l.name === 'OneSided'), 'the pending like is visible in their Likes You');
+  assert.ok(!likedMe.some((l) => l.youLikedBack), 'and it is not marked as matched back');
+
+  // Reciprocity does produce one: exactly then, and only then.
+  await ids[0].other.call('POST', '/api/swipe', { targetId: `usr:${(await a.call('GET', '/api/auth/me')).body.user.id}`, kind: 'like' });
+  const after = (await ids[0].other.call('GET', '/api/state')).body;
+  assert.equal(after.matches.length, 1, 'mutual like creates the match');
 });

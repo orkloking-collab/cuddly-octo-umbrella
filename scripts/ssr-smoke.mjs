@@ -88,6 +88,10 @@ try {
     ['Footer', '/src/components/Footer.jsx'],
     ['ProfileStrengthMeter', '/src/components/ProfileStrengthMeter.jsx'],
     ['SmartImage', '/src/components/SmartImage.jsx'],
+    ['AdManagerSheet', '/src/components/AdManagerSheet.jsx'],
+    ['GoogleSignInButton', '/src/components/GoogleSignInButton.jsx'],
+    ['InstallAppPrompt', '/src/components/InstallAppPrompt.jsx'],
+    ['AccountAuthModal', '/src/components/AccountAuthModal.jsx'],
   ]) {
     const mod = await vite.ssrLoadModule(path);
     const Comp = mod.default;
@@ -114,9 +118,41 @@ try {
       Footer: { onOpenWriteModal: () => {}, setActiveTab: () => {} },
       ProfileStrengthMeter: { strength: { score: 60, missing: [], complete: false } },
       SmartImage: { name: 'Aisha', alt: 'Aisha' },
+      AdManagerSheet: { open: true, onClose: () => {} },
+      GoogleSignInButton: {},
+      InstallAppPrompt: {},
+      AccountAuthModal: { isOpen: true, onClose: () => {}, onLoginSuccess: () => {} },
     }[name];
     await render(name, () => (props ? React.createElement(Comp, props) : React.createElement(Comp)));
   }
+  // Copy checks: the Phase 3 promises are "no fake attachments", "reels on
+  // mobile", "prices from $1" and "ads are ours", so the rendered HTML is asserted
+  // rather than eyeballed.
+  const copyChecks = [
+    ['ChatThread composer', '/src/components/ChatThread.jsx', { matchId: 'dl-aisha_karim', onClose: () => {} },
+      ['Attach a photo from your device', 'Record a voice note', 'Take a photo right now']],
+    ['ChatThread composer', '/src/components/ChatThread.jsx', { matchId: 'dl-aisha_karim', onClose: () => {} },
+      [], 'Photo (demo)'],
+    ['MobileBottomNav', '/src/components/MobileBottomNav.jsx', { activeTab: 'reels', setActiveTab: () => {}, onOpenProfileModal: () => {}, onOpenLikes: () => {} }, ['Reels']],
+    ['PremiumSheet', '/src/components/PremiumSheet.jsx', { open: true, onClose: () => {} }, ['Day Pass', '$1', '20 minutes', 'no payment provider']],
+    ['AdManagerSheet', '/src/components/AdManagerSheet.jsx', { open: true, onClose: () => {} }, ['Ad manager', 'Submit campaign', 'CPM']],
+    // Effects never run in SSR, so the Google row is asserted in its pre-config
+    // state: that proves it is mounted inside the modal, which is the contract.
+    ['AccountAuthModal', '/src/components/AccountAuthModal.jsx', { isOpen: true, onClose: () => {}, onLoginSuccess: () => {} }, ['Checking whether Google sign-in is enabled', 'or use your email']],
+  ];
+  for (const [label, path, props, needles, forbidden] of copyChecks) {
+    try {
+      const mod = await vite.ssrLoadModule(path);
+      const copyHtml = await render(`copy: ${label}`, () => React.createElement(mod.default, props));
+      for (const needle of needles || []) {
+        if (!copyHtml.includes(needle)) failures.push(`${label} HTML is missing "${needle}"`);
+      }
+      if (forbidden && copyHtml.includes(forbidden)) failures.push(`${label} still renders the placeholder "${forbidden}"`);
+    } catch (err) {
+      failures.push(`copy check ${label}: ${err.stack?.split('\n').slice(0, 3).join(' | ')}`);
+    }
+  }
+
   // Second pass with a seeded account: this is the path a real user lands on
   // (profile built, one match, unread message) and the only way to render the
   // populated deck in a headless check.

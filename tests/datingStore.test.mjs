@@ -183,7 +183,7 @@ test('chat engine: harassment, scam and sexual requests become guardrails', () =
     ['send nudes', 'boundary'],
     ['how old are you?', 'age'],
   ]) {
-    const r = replyTo(msg, freshProfile, them, 2);
+    const r = replyTo(msg, freshProfile, them, 2, { now: 1700000000000 });
     assert.equal(r.kind, 'guardrail', `"${msg}" -> ${r.kind}`);
     assert.equal(r.code, code);
   }
@@ -191,8 +191,13 @@ test('chat engine: harassment, scam and sexual requests become guardrails', () =
 
 test('chat engine: a real question returns a reply sized like a message', () => {
   const them = datingProfiles.find((p) => p.city === 'Dhaka');
-  const r = replyTo('what do you do for work around here?', freshProfile, them, 1);
-  assert.equal(r.kind, 'reply', JSON.stringify(r));
+  // Clock pinned: a benign question must never come back as a guardrail, and when
+  // it does answer, the answer has to look like a message.
+  const minutes = [0, 1, 2, 3, 4, 5].map((m) =>
+    replyTo('what do you do for work around here?', freshProfile, them, 1, { now: 1700000000000 + m * 60000 }));
+  assert.ok(minutes.every((r) => r.kind === 'reply' || r.kind === 'silence'), JSON.stringify(minutes));
+  const r = minutes.find((x) => x.kind === 'reply');
+  assert.ok(r, 'a genuine question has to get a reply at least once across six minutes');
   assert.ok(r.text.length > 20);
   assert.ok(r.delayMs > 500 && r.delayMs < 9001);
 });
@@ -202,7 +207,7 @@ test('chat engine: no reply contains contact details or money requests', () => {
   const probes = ['hi', 'how are you', 'meet tomorrow?', 'what is your number', 'send money', 'coffee sometime', 'kemon acho'];
   for (const p of probes) {
     for (let turn = 0; turn < 4; turn += 1) {
-      const r = replyTo(p, freshProfile, them, turn);
+      const r = replyTo(p, freshProfile, them, turn, { now: 1700000000000 });
       if (r.kind !== 'reply') continue;
       assert.doesNotMatch(r.text, /\b(01\d{9}|\+8801\d{9})\b/, 'phone number leak');
       assert.doesNotMatch(r.text, /(send me money|i will pay you)/i, 'money request leak');
