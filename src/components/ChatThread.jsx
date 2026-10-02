@@ -8,6 +8,13 @@ import { useDating, useDialog, useNow, timeAgo, formatCountdown } from '../utils
 import { replyTo, matchOpener, suggestedReplies, staleness } from '../utils/chatEngine';
 import { portraitTile } from '../utils/photoFallback';
 
+const REAL_CHAT_NOTICES = {
+  harassment: 'That message crossed a line. A real member can report it and lose your account over it — report yourself to Trust & Safety instead, and mean it.',
+  scam: 'Money, gift cards and crypto are the number one scam vector here. Never send, and never accept "just lend me".',
+  boundary: 'Unsolicited sexual messages are the most-reported first-contact mistake. Wait until there is a real conversation.',
+  age: "Everyone on Romancha has to be 18+ with verification. Pushing on someone's age is a review trigger.",
+};
+
 /**
  * 1:1 conversation with a match.
  * Includes the three things this app previously had none of: reply typing,
@@ -71,14 +78,22 @@ export default function ChatThread({ matchId, onClose, onOpenVideoCall, onOpenSa
     const turn = thread.messages.filter((m) => m.from === 'me').length;
     store.sendText(matchId, clean);
     setDraft('');
-    if (isRealChat && store.getState().server?.error) {
-      // fall through: the optimistic bubble stays, the banner explains the retry
-    }
     const res = replyTo(clean, store.getProfile(), them, turn);
     if (res.kind === 'silence') return;
-    // A real member's reply arrives over SSE from the server. Fabricating a
-    // response here would be the single most damaging thing this app could do.
-    if (isRealChat) return;
+    // A real member's reply arrives over SSE from the server. Fabricating one
+    // here would be the single most damaging thing this app could do. The
+    // guardrail pattern is still worth acting on, but as advice to *you* —
+    // never as words put in someone else's mouth.
+    if (isRealChat) {
+      if (res.kind === 'guardrail') {
+        store.appendMessage(matchId, {
+          from: 'system',
+          kind: 'system',
+          text: `Romancha safety notice · ${REAL_CHAT_NOTICES[res.code] || 'Our filters flagged this message. Nothing else was sent on your behalf.'}`,
+        });
+      }
+      return;
+    }
     // Replies are intentionally NOT cancelled when this sheet closes: they land in
     // the store, which is what bumps the unread badge in the inbox. A dating chat
     // that only exists while you are looking at it is not a chat.
